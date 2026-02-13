@@ -1,0 +1,164 @@
+[[permission]]
+identifier = "select-and-index"
+description = "Select and index photos"
+commands.allow = ["select_and_index"]
+
+[[permission]]
+identifier = "get-categories"
+description = "Get categories"
+commands.allow = ["get_categories"]
+
+[[permission]]
+identifier = "get-months"
+description = "Get months"
+commands.allow = ["get_months"]
+
+[[permission]]
+identifier = "get-photos"
+description = "Get photos"
+commands.allow = ["get_photos"]
+
+[[permission]]
+identifier = "search-photos"
+description = "Search photos"
+commands.allow = ["search_photos"]
+
+[[permission]]
+identifier = "get-thumbnail-path"
+description = "Get thumbnail path"
+commands.allow = ["get_thumbnail_path"]
+
+[[permission]]
+identifier = "get-index-progress"
+description = "Get index progress"
+commands.allow = ["get_index_progress"]
+
+[[permission]]
+identifier = "get-current-library-path"
+description = "Get current library path"
+commands.allow = ["get_current_library_path"]
+
+[[permission]]
+identifier = "scan-default-directories"
+description = "Scan default directories"
+commands.allow = ["scan_default_directories"]
+
+[[permission]]
+identifier = "get-all-photos"
+description = "Get all photos"
+commands.allow = ["get_all_photos"]
+
+[[permission]]
+identifier = "get-libraries"
+description = "Get libraries"
+commands.allow = ["get_libraries"]
+
+[[permission]]
+identifier = "add-library-path"
+description = "Add library path"
+commands.allow = ["add_library_path"]
+
+[[permission]]
+identifier = "remove-library-path"
+description = "Remove library path"
+commands.allow = ["remove_library_path"]
+
+[[permission]]
+identifier = "get-library-paths"
+description = "Get library paths"
+commands.allow = ["get_library_paths"]
+
+[[permission]]
+identifier = "toggle-favorite"
+description = "Toggle favorite"
+commands.allow = ["toggle_favorite"]
+
+[[permission]]
+identifier = "soft-delete-photos"
+description = "Soft delete photos"
+commands.allow = ["soft_delete_photos"]
+
+[[permission]]
+identifier = "restore-photos"
+description = "Restore photos"
+commands.allow = ["restore_photos"]
+
+[[permission]]
+identifier = "get-photo-detail"
+description = "Get photo detail"
+commands.allow = ["get_photo_detail"]
+
+[[permission]]
+identifier = "hard-delete-photos"
+description = "Hard delete photos"
+commands.allow = ["hard_delete_photos"]
+
+[[permission]]
+identifier = "rename-photo"
+description = "Rename photo"
+commands.allow = ["rename_photo"]
+
+[[permission]]
+identifier = "create-tag"
+description = "Create tag"
+commands.allow = ["create_tag"]
+
+[[permission]]
+identifier = "delete-tag"
+description = "Delete tag"
+commands.allow = ["delete_tag"]
+
+[[permission]]
+identifier = "get-tags"
+description = "Get tags"
+commands.allow = ["get_tags"]
+
+[[permission]]
+identifier = "tag-photos"
+description = "Tag photos"
+commands.allow = ["tag_photos"]
+
+[[permission]]
+identifier = "untag-photos"
+description = "Untag photos"
+commands.allow = ["untag_photos"]
+
+[[permission]]
+identifier = "get-photo-tags"
+description = "Get photo tags"
+commands.allow = ["get_photo_tags"]
+
+[[permission]]
+identifier = "create-album"
+description = "Create album"
+commands.allow = ["create_album"]
+
+[[permission]]
+identifier = "delete-album"
+description = "Delete album"
+commands.allow = ["delete_album"]
+
+[[permission]]
+identifier = "rename-album"
+description = "Rename album"
+commands.allow = ["rename_album"]
+
+[[permission]]
+identifier = "get-albums"
+description = "Get albums"
+commands.allow = ["get_albums"]
+
+[[permission]]
+identifier = "add-to-album"
+description = "Add to album"
+commands.allow = ["add_to_album"]
+
+[[permission]]
+identifier = "remove-from-album"
+description = "Remove from album"
+commands.allow = ["remove_from_album"]
+
+[[permission]]
+identifier = "get-album-photos"
+description = "Get album photos"
+commands.allow = ["get_album_photos"]

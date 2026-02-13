@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "test-cmd"
+description = "Test command"
+commands.allow = ["test_cmd"]
