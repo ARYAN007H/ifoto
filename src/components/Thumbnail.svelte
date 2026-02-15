@@ -116,11 +116,11 @@
         object-fit: cover;
         display: block;
         transition: transform 0.2s ease;
-    }
+    }-
 
     .placeholder {
         width: 100%;
-        height: 100%;
+        height: 100%;-
         background-color: var(--bg-secondary);
     }
 

@@ -2187,6 +2187,12 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Add library path",
+          "type": "string",
+          "const": "add-library-path",
+          "markdownDescription": "Add library path"
+        },
+        {
           "description": "Add to album",
           "type": "string",
           "const": "add-to-album",
@@ -2259,6 +2265,12 @@
           "markdownDescription": "Get libraries"
         },
         {
+          "description": "Get library paths",
+          "type": "string",
+          "const": "get-library-paths",
+          "markdownDescription": "Get library paths"
+        },
+        {
           "description": "Get months",
           "type": "string",
           "const": "get-months",
@@ -2305,6 +2317,12 @@
           "type": "string",
           "const": "remove-from-album",
           "markdownDescription": "Remove from album"
+        },
+        {
+          "description": "Remove library path",
+          "type": "string",
+          "const": "remove-library-path",
+          "markdownDescription": "Remove library path"
         },
         {
           "description": "Rename album",

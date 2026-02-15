@@ -147,3 +147,18 @@ commands.allow = ["remove_from_album"]
 identifier = "get-album-photos"
 description = "Get album photos"
 commands.allow = ["get_album_photos"]
+
+[[permission]]
+identifier = "add-library-path"
+description = "Add library path"
+commands.allow = ["add_library_path"]
+
+[[permission]]
+identifier = "remove-library-path"
+description = "Remove library path"
+commands.allow = ["remove_library_path"]
+
+[[permission]]
+identifier = "get-library-paths"
+description = "Get library paths"
+commands.allow = ["get_library_paths"]

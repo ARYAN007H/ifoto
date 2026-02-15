@@ -15,13 +15,13 @@
     import PhotoGrid from "./components/PhotoGrid.svelte";
     import DetailView from "./components/DetailView.svelte";
     import EmptyState from "./components/EmptyState.svelte";
-  import Settings from "./components/SettingsPanel.svelte";
+    import SettingsPanel from "./components/SettingsPanel.svelte";
     import BottomPill from "./components/BottomPill.svelte";
     import BatchActionBar from "./components/BatchActionBar.svelte";
     import { photos, libraryPath } from "./lib/store";
 
     onMount(() => {
-    console.log("App mounted");
+        console.log("App mounted");
         initAutoScan();
         loadTags();
         loadAlbums();

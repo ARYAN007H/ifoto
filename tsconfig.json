@@ -17,7 +17,9 @@
         "types": [
             "svelte",
             "vite/client"
-        ]
+        ],
+        "verbatimModuleSyntax": true,
+        "isolatedModules": true
     },
     "include": [
         "src/**/*.d.ts",

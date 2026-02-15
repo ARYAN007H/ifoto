@@ -224,6 +224,13 @@ impl Database {
         Ok(())
     }
 
+    pub fn remove_library(&self, library_id: i64) -> SqlResult<()> {
+        self.clear_photos_for_library(library_id)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM library WHERE id = ?1", [library_id])?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn insert_photo(
         &self,

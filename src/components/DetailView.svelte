@@ -1,6 +1,4 @@
 <script lang="ts">
-    import TagInput from "./TagInput.svelte";
-    import Settings from "./Settings.svelte";
     import { icons } from "../lib/icons";
     import {
         selectedPhoto,

@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::mpsc;
 
-pub(crate) struct AppState {
+pub struct AppState {
     db: Mutex<Option<Database>>,
     library_root: Mutex<Option<String>>,
     library_roots: Mutex<Vec<(i64, String)>>,
@@ -417,6 +417,34 @@ pub async fn get_libraries(
     let db_guard = state.db.lock().unwrap();
     let db = db_guard.as_ref().ok_or("No library loaded")?;
     db.get_all_libraries().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn add_library_path(app: AppHandle, path: String) -> Result<serde_json::Value, String> {
+    select_and_index(app, path).await
+}
+
+#[tauri::command]
+pub async fn remove_library_path(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let db_guard = state.db.lock().unwrap();
+    let db = db_guard.as_ref().ok_or("No library loaded")?;
+    
+    // Find library by path
+    let libraries = db.get_all_libraries().map_err(|e| e.to_string())?;
+    // Simple string match for now, could be more robust with canonicalization
+    if let Some(lib) = libraries.iter().find(|l| l.root_path == path) {
+        db.remove_library(lib.id).map_err(|e| e.to_string())?;
+    }
+    
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_library_paths(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let db_guard = state.db.lock().unwrap();
+    let db = db_guard.as_ref().ok_or("No library loaded")?;
+    let libraries = db.get_all_libraries().map_err(|e| e.to_string())?;
+    Ok(libraries.into_iter().map(|l| l.root_path).collect())
 }
 
 /// Toggle favorite status on a photo
