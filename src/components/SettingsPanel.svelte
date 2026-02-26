@@ -6,7 +6,7 @@
         updateSettings,
         folders,
     } from "../lib/store";
-    import type { AccentColor } from "../lib/store";
+    import type { AccentColor, ColorPalette } from "../lib/store";
 
     type SettingsTab = "general" | "appearance" | "library" | "shortcuts";
     let activeTab: SettingsTab = "general";
@@ -39,6 +39,43 @@
         { id: "green", label: "Green", color: "#22c55e" },
         { id: "teal", label: "Teal", color: "#14b8a6" },
         { id: "indigo", label: "Indigo", color: "#6366f1" },
+    ];
+
+    const colorPalettes: {
+        id: ColorPalette;
+        label: string;
+        colors: [string, string, string];
+    }[] = [
+        {
+            id: "default",
+            label: "Default",
+            colors: ["#3b82f6", "#3E4759", "#51405E"],
+        },
+        {
+            id: "lavender",
+            label: "Lavender",
+            colors: ["#C9B3FF", "#4A4458", "#EFB8C8"],
+        },
+        {
+            id: "mauve",
+            label: "Mauve",
+            colors: ["#FFB1C8", "#5B3F47", "#F0BD94"],
+        },
+        {
+            id: "sage",
+            label: "Sage",
+            colors: ["#A0D5B1", "#364B40", "#A6CDDD"],
+        },
+        {
+            id: "coral",
+            label: "Coral",
+            colors: ["#FFB4A8", "#5D3F3B", "#DDBF7E"],
+        },
+        {
+            id: "ocean",
+            label: "Ocean",
+            colors: ["#8ECFF2", "#364954", "#CABED0"],
+        },
     ];
 
     function toggleFolderHidden(folder: string) {
@@ -288,43 +325,92 @@
                     </div>
 
                     <div class="settings-group">
-                        <h4 class="group-title">Accent Color</h4>
-                        <div class="accent-grid">
-                            {#each accentColors as accent}
+                        <h4 class="group-title">Color Palette</h4>
+                        <p class="group-desc">
+                            Choose a coordinated M3 Expressive color scheme
+                        </p>
+                        <div class="palette-grid">
+                            {#each colorPalettes as palette}
                                 <button
-                                    class="accent-swatch"
-                                    class:active={$appSettings.accentColor ===
-                                        accent.id}
+                                    class="palette-card"
+                                    class:active={$appSettings.colorPalette ===
+                                        palette.id}
                                     on:click={() =>
                                         updateSettings({
-                                            accentColor: accent.id,
+                                            colorPalette: palette.id,
                                         })}
-                                    title={accent.label}
+                                    title={palette.label}
                                 >
-                                    <span
-                                        class="swatch-circle"
-                                        style="background: {accent.color}"
+                                    <div class="palette-dots">
+                                        {#each palette.colors as color}
+                                            <span
+                                                class="palette-dot"
+                                                style="background: {color}"
+                                            ></span>
+                                        {/each}
+                                    </div>
+                                    <span class="palette-name"
+                                        >{palette.label}</span
                                     >
-                                        {#if $appSettings.accentColor === accent.id}
+                                    {#if $appSettings.colorPalette === palette.id}
+                                        <div class="palette-check">
                                             <svg
-                                                width="12"
-                                                height="12"
+                                                width="14"
+                                                height="14"
                                                 viewBox="0 0 24 24"
-                                                fill="white"
+                                                fill="currentColor"
                                             >
                                                 <path
                                                     d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z"
                                                 />
                                             </svg>
-                                        {/if}
-                                    </span>
-                                    <span class="swatch-label"
-                                        >{accent.label}</span
-                                    >
+                                        </div>
+                                    {/if}
                                 </button>
                             {/each}
                         </div>
                     </div>
+
+                    {#if $appSettings.colorPalette === "default"}
+                        <div class="settings-group">
+                            <h4 class="group-title">Accent Color</h4>
+                            <div class="accent-grid">
+                                {#each accentColors as accent}
+                                    <button
+                                        class="accent-swatch"
+                                        class:active={$appSettings.accentColor ===
+                                            accent.id}
+                                        on:click={() =>
+                                            updateSettings({
+                                                accentColor: accent.id,
+                                            })}
+                                        title={accent.label}
+                                    >
+                                        <span
+                                            class="swatch-circle"
+                                            style="background: {accent.color}"
+                                        >
+                                            {#if $appSettings.accentColor === accent.id}
+                                                <svg
+                                                    width="12"
+                                                    height="12"
+                                                    viewBox="0 0 24 24"
+                                                    fill="white"
+                                                >
+                                                    <path
+                                                        d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z"
+                                                    />
+                                                </svg>
+                                            {/if}
+                                        </span>
+                                        <span class="swatch-label"
+                                            >{accent.label}</span
+                                        >
+                                    </button>
+                                {/each}
+                            </div>
+                        </div>
+                    {/if}
 
                     <div class="settings-group">
                         <h4 class="group-title">Layout Mode</h4>
@@ -940,6 +1026,87 @@
     .accent-swatch.active .swatch-label {
         color: var(--accent);
         font-weight: 600;
+    }
+
+    /* ── M3 Color Palette Picker ── */
+    .palette-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: var(--sp-2);
+    }
+
+    .palette-card {
+        position: relative;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
+        padding: var(--sp-3) var(--sp-2);
+        border-radius: var(--radius-xl);
+        background: var(--md-sys-color-surface-container-high);
+        border: 2px solid transparent;
+        transition: var(--transition-base);
+        cursor: pointer;
+    }
+
+    .palette-card:hover {
+        background: var(--md-sys-color-surface-container-highest);
+        transform: scale(1.02);
+    }
+
+    .palette-card.active {
+        border-color: var(--accent);
+        background: var(--accent-subtle);
+    }
+
+    .palette-dots {
+        display: flex;
+        gap: 4px;
+        align-items: center;
+    }
+
+    .palette-dot {
+        width: 18px;
+        height: 18px;
+        border-radius: 9px;
+        box-shadow: var(--shadow-xs);
+        transition: transform 0.2s var(--ease-spring);
+    }
+
+    .palette-card:hover .palette-dot {
+        transform: scale(1.1);
+    }
+
+    .palette-dot:first-child {
+        width: 22px;
+        height: 22px;
+        border-radius: 11px;
+    }
+
+    .palette-name {
+        font-size: 11px;
+        font-weight: 500;
+        color: var(--text-tertiary);
+    }
+
+    .palette-card.active .palette-name {
+        color: var(--accent);
+        font-weight: 600;
+    }
+
+    .palette-check {
+        position: absolute;
+        top: 6px;
+        right: 6px;
+        width: 20px;
+        height: 20px;
+        border-radius: 10px;
+        background: var(--accent);
+        color: white;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        animation: fadeInScale 0.2s var(--ease-emphasized-decel);
     }
 
     /* ── M3 Layout Cards ── */

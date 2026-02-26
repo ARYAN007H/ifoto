@@ -2277,6 +2277,12 @@
           "markdownDescription": "Get months"
         },
         {
+          "description": "Get total photo count",
+          "type": "string",
+          "const": "get-photo-count",
+          "markdownDescription": "Get total photo count"
+        },
+        {
           "description": "Get photo detail",
           "type": "string",
           "const": "get-photo-detail",

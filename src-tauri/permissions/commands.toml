@@ -172,3 +172,8 @@ commands.allow = ["restore_session"]
 identifier = "save-edited-photo"
 description = "Save edited photo"
 commands.allow = ["save_edited_photo"]
+
+[[permission]]
+identifier = "get-photo-count"
+description = "Get total photo count"
+commands.allow = ["get_photo_count"]

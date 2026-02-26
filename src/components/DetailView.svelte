@@ -85,10 +85,8 @@
     async function loadMainImage(photo: Photo) {
         imageLoading = true;
         try {
-            const thumbPath = await getThumbnail(photo.path);
-            if (thumbPath) {
-                imageSrc = convertFileSrc(thumbPath);
-            }
+            // Load the full resolution image directly using its absolute path
+            imageSrc = convertFileSrc(photo.path);
         } catch (err) {
             console.error("Failed to load image:", err);
         }

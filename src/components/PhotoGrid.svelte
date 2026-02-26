@@ -91,6 +91,59 @@
         }
     }
 
+    // ── Viewport-Aware Lazy Loading ──
+    // Only set img src when the card is near the viewport, clear when far away.
+    // This prevents hundreds of full-res images from being decoded in GPU memory.
+
+    const lazyObservers = new Map<HTMLElement, IntersectionObserver>();
+
+    function lazyLoad(node: HTMLElement, photo: Photo) {
+        const img = node.querySelector("img.lazy-photo") as HTMLImageElement;
+        if (!img) return;
+
+        const observer = new IntersectionObserver(
+            (entries) => {
+                for (const entry of entries) {
+                    if (entry.isIntersecting) {
+                        // Load: set src when within view buffer
+                        if (!img.src || img.src === "") {
+                            img.src = getPhotoUrl(photo);
+                        }
+                    } else {
+                        // Unload: clear src when far from viewport to free GPU memory
+                        // Only clear if it's very far away (5x viewport)
+                        const rect = entry.boundingClientRect;
+                        const viewportHeight =
+                            entry.rootBounds?.height || window.innerHeight;
+                        const distance = Math.max(
+                            rect.top -
+                                (entry.rootBounds?.bottom ||
+                                    window.innerHeight),
+                            (entry.rootBounds?.top || 0) - rect.bottom,
+                        );
+                        if (distance > viewportHeight * 4 && img.src) {
+                            img.removeAttribute("src");
+                        }
+                    }
+                }
+            },
+            {
+                // Load when within 2 viewport heights
+                rootMargin: "200% 0px 200% 0px",
+            },
+        );
+
+        observer.observe(node);
+        lazyObservers.set(node, observer);
+
+        return {
+            destroy() {
+                observer.disconnect();
+                lazyObservers.delete(node);
+            },
+        };
+    }
+
     // ── Infinite Scroll ──
     let sentinel: HTMLDivElement;
     let observer: IntersectionObserver;
@@ -113,6 +166,9 @@
 
     onDestroy(() => {
         observer?.disconnect();
+        // Clean up all lazy observers
+        lazyObservers.forEach((obs) => obs.disconnect());
+        lazyObservers.clear();
     });
 
     // Re-observe whenever the sentinel element is recreated by Svelte
@@ -130,6 +186,20 @@
         if (aspect < 0.7) return "span-tall";
         return "";
     }
+
+    // Disable heavy animations for large groups
+    function getAnimDelay(groupIdx: number, photoCount: number): string {
+        if (photoCount > 100) return "0s";
+        return `${groupIdx * 0.04}s`;
+    }
+
+    function handleImgError(e: Event) {
+        const target = e.currentTarget as HTMLImageElement | null;
+        if (target) {
+            target.style.display = "none";
+            target.nextElementSibling?.classList.add("show");
+        }
+    }
 </script>
 
 <!-- svelte-ignore a11y-no-static-element-interactions -->
@@ -140,14 +210,17 @@
     on:wheel={handleWheel}
 >
     {#each $groupedPhotos as group, groupIdx (group.dateKey)}
-        <div class="date-section" style="animation-delay: {groupIdx * 0.04}s">
-            <div class="date-header">
+        <div
+            class="date-section"
+            style="animation-delay: {getAnimDelay(
+                groupIdx,
+                group.photos.length,
+            )}"
+        >
+            <div class="date-header-pill">
                 <h2 class="date-label">{group.label}</h2>
-                <span class="date-count"
-                    >{group.photos.length} photo{group.photos.length !== 1
-                        ? "s"
-                        : ""}</span
-                >
+                <span class="date-dot">·</span>
+                <span class="date-count">{group.photos.length}</span>
             </div>
 
             <div
@@ -160,6 +233,7 @@
                         class:selected={$selectedPhotoIds.has(photo.id)}
                         on:click={() => openPhoto(photo)}
                         title={photo.filename}
+                        use:lazyLoad={photo}
                         style="aspect-ratio: {$appSettings.layoutMode ===
                         'expressive'
                             ? getPhotoAspect(photo)
@@ -189,17 +263,12 @@
 
                         <div class="photo-thumb">
                             <img
-                                src={getPhotoUrl(photo)}
+                                class="lazy-photo"
                                 alt={photo.filename}
                                 loading="lazy"
                                 decoding="async"
                                 draggable="false"
-                                on:error={(e) => {
-                                    e.currentTarget.style.display = "none";
-                                    e.currentTarget.nextElementSibling?.classList.add(
-                                        "show",
-                                    );
-                                }}
+                                on:error={handleImgError}
                             />
                             <div class="placeholder fallback">
                                 <span class="placeholder-icon"
@@ -269,29 +338,43 @@
             backwards;
     }
 
-    .date-header {
-        display: flex;
-        align-items: baseline;
-        gap: var(--sp-3);
-        padding: var(--sp-2) var(--sp-1);
+    .date-header-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 16px;
         margin-bottom: var(--sp-3);
         position: sticky;
-        top: -1px;
+        top: 4px;
         z-index: 10;
-        background: var(--bg-app);
+        background: var(--md-sys-color-secondary-container);
+        backdrop-filter: blur(16px) saturate(1.4);
+        -webkit-backdrop-filter: blur(16px) saturate(1.4);
+        border-radius: 20px;
+        box-shadow:
+            0 2px 8px rgba(0, 0, 0, 0.06),
+            inset 0 1px 0 rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.04);
     }
 
     .date-label {
-        font-size: var(--text-md);
-        font-weight: 700;
-        letter-spacing: var(--letter-tight);
-        color: var(--text-primary);
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+        color: var(--md-sys-color-on-secondary-container);
+    }
+
+    .date-dot {
+        font-size: 12px;
+        color: var(--md-sys-color-on-secondary-container);
+        opacity: 0.5;
     }
 
     .date-count {
-        font-size: var(--text-xs);
-        color: var(--text-tertiary);
-        font-weight: 500;
+        font-size: 12px;
+        color: var(--md-sys-color-on-secondary-container);
+        font-weight: 600;
+        opacity: 0.7;
     }
 
     /* ── M3 Grid ── */
@@ -318,8 +401,8 @@
         border-radius: var(--radius-xs);
     }
 
-    .layout-compact .date-header {
-        padding: var(--sp-1) 2px;
+    .layout-compact .date-header-pill {
+        padding: 4px 12px;
         margin-bottom: 2px;
     }
 
@@ -339,7 +422,7 @@
         grid-auto-rows: 140px;
     }
 
-    .layout-expressive .date-header {
+    .layout-expressive .date-header-pill {
         display: none;
     }
 

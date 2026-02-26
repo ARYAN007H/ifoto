@@ -25,6 +25,7 @@ pub fn run() {
             commands::get_current_library_path,
             commands::scan_default_directories,
             commands::get_all_photos,
+            commands::get_photo_count,
             commands::get_libraries,
             commands::restore_session,
             commands::add_library_path,

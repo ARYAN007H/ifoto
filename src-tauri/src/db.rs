@@ -231,7 +231,7 @@ impl Database {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, dead_code)]
     pub fn insert_photo(
         &self,
         library_id: i64,

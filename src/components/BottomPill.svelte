@@ -1,6 +1,6 @@
 <script lang="ts">
     import { icons } from "../lib/icons";
-    import { activeSection, favoritesCount } from "../lib/store";
+    import { activeSection, favoritesCount, selectedPhoto } from "../lib/store";
     import type { SidebarSection } from "../lib/store";
 
     function setSection(section: SidebarSection) {
@@ -19,123 +19,139 @@
         { id: "recents", label: "Recents", icon: icons.clock },
         { id: "videos", label: "Videos", icon: icons.video },
     ];
+
+    // Hide pill when detail view is open
+    $: isHidden = $selectedPhoto !== null;
 </script>
 
-<nav class="m3-nav-bar" aria-label="Navigation">
-    <div class="nav-bar-inner">
-        {#each items as item (item.id)}
-            <button
-                class="nav-bar-item"
-                class:active={$activeSection === item.id}
-                on:click={() => setSection(item.id)}
-                title={item.label}
-            >
-                <div class="icon-container">
-                    <div
-                        class="active-pill"
-                        class:show={$activeSection === item.id}
-                    ></div>
-                    <span
-                        class="nav-bar-icon"
-                        class:active-icon={$activeSection === item.id}
-                    >
-                        {@html item.icon}
-                    </span>
-                    {#if item.id === "favorites" && $favoritesCount > 0}
-                        <span class="nav-badge">{$favoritesCount}</span>
-                    {/if}
-                </div>
-                <span class="nav-bar-label">{item.label}</span>
-            </button>
-        {/each}
-    </div>
-</nav>
+{#if !isHidden}
+    <nav class="m3-nav-pill" aria-label="Navigation">
+        <div class="pill-inner">
+            {#each items as item (item.id)}
+                <button
+                    class="pill-item"
+                    class:active={$activeSection === item.id}
+                    on:click={() => setSection(item.id)}
+                    title={item.label}
+                >
+                    <div class="pill-icon-wrap">
+                        <div
+                            class="active-bg"
+                            class:show={$activeSection === item.id}
+                        ></div>
+                        <span
+                            class="pill-icon"
+                            class:active-icon={$activeSection === item.id}
+                        >
+                            {@html item.icon}
+                        </span>
+                        {#if item.id === "favorites" && $favoritesCount > 0}
+                            <span class="pill-badge">{$favoritesCount}</span>
+                        {/if}
+                    </div>
+                    <span class="pill-label">{item.label}</span>
+                </button>
+            {/each}
+        </div>
+    </nav>
+{/if}
 
 <style>
-    /* ── M3 Navigation Bar (Pixel-style) ── */
-    .m3-nav-bar {
+    /* ── M3 Expressive Floating Navigation Pill ── */
+    .m3-nav-pill {
         position: fixed;
-        bottom: 0;
-        left: 0;
-        right: 0;
+        bottom: 16px;
+        left: 50%;
+        transform: translateX(-50%);
         z-index: 900;
-        animation: navBarSlideUp var(--duration-emphasized)
-            var(--ease-emphasized-decel) both;
-        padding: 0 var(--sp-4);
-        padding-bottom: env(safe-area-inset-bottom, 0);
+        animation: navPillUp 0.5s var(--ease-emphasized-decel) both;
+        pointer-events: none;
     }
 
-    @keyframes navBarSlideUp {
+    @keyframes navPillUp {
         from {
             opacity: 0;
-            transform: translateY(100%);
+            transform: translateX(-50%) translateY(40px) scale(0.9);
         }
         to {
             opacity: 1;
-            transform: translateY(0);
+            transform: translateX(-50%) translateY(0) scale(1);
         }
     }
 
-    .nav-bar-inner {
+    .pill-inner {
         display: flex;
         align-items: center;
-        justify-content: space-around;
-        height: var(--nav-bar-height);
-        max-width: 420px;
-        margin: 0 auto;
+        justify-content: center;
+        gap: 8px; /* Increased gap */
+        height: 80px; /* Increased from 64px */
+        padding: 8px 16px; /* Increased padding */
+        border-radius: 40px; /* Increased rounded corners */
         background: var(--md-sys-color-surface-container);
-        border-radius: var(--radius-2xl) var(--radius-2xl) 0 0;
-        box-shadow: var(--shadow-lg);
-        padding: 0 var(--sp-2);
+        backdrop-filter: blur(24px) saturate(1.6);
+        -webkit-backdrop-filter: blur(24px) saturate(1.6);
+        box-shadow:
+            0 8px 32px rgba(0, 0, 0, 0.12),
+            0 2px 8px rgba(0, 0, 0, 0.06),
+            inset 0 1px 0 rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        pointer-events: all;
     }
 
-    .nav-bar-item {
+    .pill-item {
         position: relative;
         display: flex;
         flex-direction: column;
         align-items: center;
-        gap: 4px;
-        padding: 12px 0;
+        gap: 2px;
+        padding: 4px 0;
         color: var(--text-secondary);
         cursor: pointer;
-        transition: color var(--duration-base) var(--ease-emphasized);
+        transition: color 0.2s var(--ease-emphasized);
         -webkit-tap-highlight-color: transparent;
         white-space: nowrap;
-        min-width: 64px;
+        min-width: 72px; /* Increased from 56px */
+        border-radius: 20px;
     }
 
-    .nav-bar-item.active {
+    .pill-item:hover {
+        color: var(--text-primary);
+    }
+
+    .pill-item.active {
         color: var(--md-sys-color-on-secondary-container);
     }
 
-    /* ── Animated Indicator Pill (Pixel signature) ── */
-    .icon-container {
+    /* ── M3 Expressive Animated Indicator ── */
+    .pill-icon-wrap {
         position: relative;
         display: flex;
         align-items: center;
         justify-content: center;
-        width: 64px;
-        height: 32px;
+        width: 64px; /* Increased width */
+        height: 36px; /* Increased height */
     }
 
-    .active-pill {
+    .active-bg {
         position: absolute;
         inset: 0;
         background: var(--md-sys-color-secondary-container);
-        border-radius: var(--radius-full);
+        border-radius: 18px; /* Increased */
         transform: scaleX(0);
         opacity: 0;
         transition:
-            transform var(--duration-emphasized) var(--ease-emphasized),
-            opacity var(--duration-base) var(--ease-standard);
+            transform 0.35s var(--ease-emphasized),
+            opacity 0.2s var(--ease-standard),
+            border-radius 0.35s var(--ease-emphasized);
     }
 
-    .active-pill.show {
+    .active-bg.show {
         transform: scaleX(1);
         opacity: 1;
+        border-radius: 16px;
     }
 
-    .nav-bar-icon {
+    .pill-icon {
         display: flex;
         align-items: center;
         justify-content: center;
@@ -143,33 +159,38 @@
         height: 24px;
         position: relative;
         z-index: 1;
-        transition: transform var(--duration-base) var(--ease-spring);
+        transition: transform 0.25s var(--ease-spring);
     }
 
-    .nav-bar-icon :global(svg) {
-        width: 22px;
-        height: 22px;
+    .pill-icon :global(svg) {
+        width: 26px; /* Increased from 24px */
+        height: 26px; /* Increased from 24px */
     }
 
-    .nav-bar-item.active .nav-bar-icon {
-        transform: scale(1.05);
+    .pill-item.active .pill-icon {
+        transform: scale(1.08);
     }
 
     /* ── Label ── */
-    .nav-bar-label {
-        font-size: 12px;
+    .pill-label {
+        font-size: 13px; /* Increased from 12px */
         font-weight: 600;
         letter-spacing: 0.02em;
         line-height: 1;
         position: relative;
         z-index: 1;
+        opacity: 0.85;
+    }
+
+    .pill-item.active .pill-label {
+        opacity: 1;
     }
 
     /* ── Badge ── */
-    .nav-badge {
+    .pill-badge {
         position: absolute;
-        top: -2px;
-        right: 10px;
+        top: -3px;
+        right: 8px;
         min-width: 16px;
         height: 16px;
         padding: 0 4px;
@@ -177,7 +198,7 @@
         color: var(--md-sys-color-on-error);
         font-size: 10px;
         font-weight: 700;
-        border-radius: var(--radius-full);
+        border-radius: 8px;
         display: flex;
         align-items: center;
         justify-content: center;

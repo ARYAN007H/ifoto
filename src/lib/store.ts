@@ -52,6 +52,7 @@ export type LayoutMode = 'compact' | 'default' | 'expressive'
 export type SortBy = 'date-desc' | 'date-asc' | 'name-asc' | 'name-desc' | 'size-desc' | 'size-asc'
 export type SidebarSection = 'all' | 'recents' | 'favorites' | 'videos' | 'source' | 'trash' | 'album' | 'tag'
 export type AccentColor = 'blue' | 'purple' | 'pink' | 'red' | 'orange' | 'green' | 'teal' | 'indigo'
+export type ColorPalette = 'default' | 'lavender' | 'mauve' | 'sage' | 'coral' | 'ocean'
 
 export interface AppSettings {
     theme: Theme
@@ -60,6 +61,7 @@ export interface AppSettings {
     gridZoom: number // 1-5 scale
     showSidebar: boolean
     accentColor: AccentColor
+    colorPalette: ColorPalette
     hiddenFolders: string[]
     pinnedFolders: string[]
     maxVisibleFolders: number
@@ -82,6 +84,7 @@ const defaultSettings: AppSettings = {
     gridZoom: 3,
     showSidebar: true,
     accentColor: 'blue',
+    colorPalette: 'default',
     hiddenFolders: [],
     pinnedFolders: [],
     maxVisibleFolders: 8,
@@ -127,14 +130,37 @@ function applyAccent(color: AccentColor) {
     root.style.setProperty('--shadow-glow', `0 0 20px ${p.glow}`)
 }
 
+function applyPalette(palette: ColorPalette) {
+    if (palette === 'default') {
+        document.documentElement.removeAttribute('data-palette')
+    } else {
+        document.documentElement.setAttribute('data-palette', palette)
+    }
+}
+
 applyTheme(initialSettings.theme)
 applyAccent(initialSettings.accentColor)
+applyPalette(initialSettings.colorPalette)
 
 // Persist on change
 appSettings.subscribe(s => {
     saveSettings(s)
     applyTheme(s.theme)
-    applyAccent(s.accentColor)
+    applyPalette(s.colorPalette)
+    // Only apply accent presets when using default palette
+    // (palettes define their own accent colors via CSS)
+    if (s.colorPalette === 'default') {
+        applyAccent(s.accentColor)
+    } else {
+        // Clear inline accent overrides so CSS palette takes effect
+        const root = document.documentElement
+        root.style.removeProperty('--accent')
+        root.style.removeProperty('--accent-hover')
+        root.style.removeProperty('--accent-text')
+        root.style.removeProperty('--accent-subtle')
+        root.style.removeProperty('--accent-glow')
+        root.style.removeProperty('--shadow-glow')
+    }
 })
 
 // Theme toggle helper
@@ -157,7 +183,8 @@ export const selectedPhoto = writable<Photo | null>(null)
 export const isIndexing = writable<boolean>(false)
 export const hasMorePhotos = writable<boolean>(true)
 export const isLoadingMore = writable<boolean>(false)
-const PAGE_SIZE = 500
+const PAGE_SIZE = 100
+const MAX_PHOTOS_IN_MEMORY = 2000
 export const indexProgress = writable<{
     current: number
     total: number
@@ -178,6 +205,7 @@ export const showEditor = writable<boolean>(false)
 export const showInfoPanel = writable<boolean>(false)
 export const sourceDirectories = writable<SourceDirectory[]>([])
 export const activeSource = writable<string | null>(null) // null = all sources
+export const totalPhotoCount = writable<number>(0)
 
 // Filters
 export const filters = writable<FilterState>({
@@ -454,6 +482,13 @@ export async function searchPhotos(query: string) {
     searchQuery.set(query)
 }
 
+// Debounced search for input fields
+let searchTimer: ReturnType<typeof setTimeout> | null = null
+export function debouncedSearch(query: string, delay = 300) {
+    if (searchTimer) clearTimeout(searchTimer)
+    searchTimer = setTimeout(() => searchQuery.set(query), delay)
+}
+
 // ── Auto-Scan Default Directories ──
 
 export async function initAutoScan() {
@@ -488,6 +523,12 @@ export async function loadAllPhotos() {
         photos.set(firstPage || [])
         hasMorePhotos.set((firstPage || []).length >= PAGE_SIZE)
 
+        // Fetch total count from backend (cheap COUNT query)
+        try {
+            const count = await invoke<number>('get_photo_count')
+            totalPhotoCount.set(count)
+        } catch { /* fallback: count unknown */ }
+
         // Refresh source directory counts
         try {
             const libs = await invoke<SourceDirectory[]>('get_libraries')
@@ -509,7 +550,16 @@ export async function loadMorePhotos() {
         if (!nextPage || nextPage.length === 0) {
             hasMorePhotos.set(false)
         } else {
-            photos.update(list => [...list, ...nextPage])
+            photos.update(list => {
+                const combined = [...list, ...nextPage]
+                // Sliding window eviction: keep only the latest MAX_PHOTOS_IN_MEMORY
+                if (combined.length > MAX_PHOTOS_IN_MEMORY) {
+                    const evicted = combined.slice(combined.length - MAX_PHOTOS_IN_MEMORY)
+                    console.log(`[Memory] Evicted ${combined.length - evicted.length} photos from store (cap: ${MAX_PHOTOS_IN_MEMORY})`)
+                    return evicted
+                }
+                return combined
+            })
             hasMorePhotos.set(nextPage.length >= PAGE_SIZE)
         }
     } catch (err) {

@@ -44,6 +44,8 @@
     "get-albums",
     "add-to-album",
     "remove-from-album",
-    "get-album-photos"
+    "get-album-photos",
+    "save-edited-photo",
+    "get-photo-count"
   ]
 }

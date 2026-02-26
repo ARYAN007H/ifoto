@@ -143,7 +143,9 @@
     }
 
     .main-content.has-pill {
-        padding-bottom: calc(var(--nav-bar-height) + 8px);
+        /* Remove padding to let the grid scroll under the pill, 
+           making it a true floating island */
+        padding-bottom: 0px;
     }
 
     /* ── M3 Indexing State ── */
