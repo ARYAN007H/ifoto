@@ -2,16 +2,41 @@
     import { fade } from "svelte/transition";
     import type { Photo } from "../lib/store";
     import { icons } from "../lib/icons";
-    import { convertFileSource } from "../lib/store";
+    import { getThumbnail, convertFileSource } from "../lib/store";
+    import { getCachedThumb, cacheThumb } from "../lib/thumbnailCache";
 
     export let photo: Photo;
     export let selected: boolean = false;
     export let size: number = 200;
 
-    $: src = convertFileSource(photo.path);
-
+    let src = '';
     let loaded = false;
     let errored = false;
+
+    // Use LRU cache for thumbnail loading
+    $: {
+        const cached = getCachedThumb(photo.path);
+        if (cached) {
+            src = cached;
+        } else {
+            src = '';
+            getThumbnail(photo.path).then(thumbPath => {
+                if (thumbPath) {
+                    const url = convertFileSource(thumbPath);
+                    cacheThumb(photo.path, url);
+                    src = url;
+                } else {
+                    const url = convertFileSource(photo.path);
+                    cacheThumb(photo.path, url);
+                    src = url;
+                }
+            }).catch(() => {
+                const url = convertFileSource(photo.path);
+                cacheThumb(photo.path, url);
+                src = url;
+            });
+        }
+    }
 
     function formatDuration(seconds: number): string {
         const m = Math.floor(seconds / 60);

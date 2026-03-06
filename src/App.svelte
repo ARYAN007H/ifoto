@@ -36,6 +36,11 @@
     $: isExpressive = $appSettings.layoutMode === "expressive";
     $: showSidebar = $appSettings.showSidebar && !isExpressive;
 
+    // Performance Mode: set body attribute for CSS overrides
+    $: if (typeof document !== 'undefined') {
+        document.body.setAttribute('data-perf-mode', String($appSettings.performanceMode));
+    }
+
     // Keyboard shortcuts
     function handleKeydown(e: KeyboardEvent) {
         // Escape to close detail view or settings

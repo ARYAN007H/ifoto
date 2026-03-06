@@ -2307,6 +2307,12 @@
           "markdownDescription": "Get photos"
         },
         {
+          "description": "Get system info for performance mode",
+          "type": "string",
+          "const": "get-system-info",
+          "markdownDescription": "Get system info for performance mode"
+        },
+        {
           "description": "Get tags",
           "type": "string",
           "const": "get-tags",
@@ -2377,6 +2383,12 @@
           "type": "string",
           "const": "scan-default-directories",
           "markdownDescription": "Scan default directories"
+        },
+        {
+          "description": "Scan directory with streaming events",
+          "type": "string",
+          "const": "scan-directory",
+          "markdownDescription": "Scan directory with streaming events"
         },
         {
           "description": "Search photos",

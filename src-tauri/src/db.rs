@@ -168,6 +168,16 @@ impl Database {
                 FOREIGN KEY (album_id) REFERENCES albums(id) ON DELETE CASCADE,
                 FOREIGN KEY (photo_id) REFERENCES photos(id) ON DELETE CASCADE
             );
+
+            -- Directory cache for instant re-opens
+            CREATE TABLE IF NOT EXISTS directories (
+                path          TEXT    PRIMARY KEY,
+                last_scanned  INTEGER NOT NULL,
+                photo_count   INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_photos_file_path     ON photos(path);
+            CREATE INDEX IF NOT EXISTS idx_photos_date_modified ON photos(modified_at);
             "#,
         )?;
         // Run migrations for existing databases
@@ -196,6 +206,8 @@ impl Database {
             ("focal_length", "ALTER TABLE photos ADD COLUMN focal_length TEXT"),
             ("gps_lat", "ALTER TABLE photos ADD COLUMN gps_lat REAL"),
             ("gps_lon", "ALTER TABLE photos ADD COLUMN gps_lon REAL"),
+            ("thumb_path", "ALTER TABLE photos ADD COLUMN thumb_path TEXT"),
+            ("date_modified_unix", "ALTER TABLE photos ADD COLUMN date_modified_unix INTEGER NOT NULL DEFAULT 0"),
         ];
 
         for (col, sql) in migrations {
@@ -899,5 +911,122 @@ impl Database {
             out.push(Self::photo_from_row(row, String::new())?);
         }
         Ok(out)
+    }
+
+    // ── Directory Cache ──
+
+    /// Get the last scan timestamp for a directory (for hot-cache check)
+    pub fn get_directory_scan_time(&self, dir_path: &str) -> SqlResult<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT last_scanned FROM directories WHERE path = ?1"
+        )?;
+        let mut rows = stmt.query([dir_path])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(row.get(0)?));
+        }
+        Ok(None)
+    }
+
+    /// Insert or update directory scan metadata
+    pub fn upsert_directory(&self, dir_path: &str, photo_count: i64) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO directories (path, last_scanned, photo_count) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(path) DO UPDATE SET last_scanned = ?2, photo_count = ?3",
+            rusqlite::params![dir_path, now, photo_count],
+        )?;
+        Ok(())
+    }
+
+    /// Get all cached photos for a directory prefix (for instant re-opens)
+    pub fn get_cached_photos_for_dir(&self, dir_path: &str) -> SqlResult<Vec<crate::thumb::ThumbnailInfo>> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = format!("{}%", dir_path);
+        let mut stmt = conn.prepare(
+            "SELECT path, thumb_path, width, height, filename, size_bytes, date_modified_unix \
+             FROM photos WHERE path LIKE ?1 AND is_deleted = 0"
+        )?;
+        let mut rows = stmt.query([&pattern])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let thumb_path: Option<String> = row.get(1)?;
+            out.push(crate::thumb::ThumbnailInfo {
+                original_path: row.get(0)?,
+                thumb_path: thumb_path.unwrap_or_default(),
+                width: row.get::<_, Option<u32>>(2)?.unwrap_or(0),
+                height: row.get::<_, Option<u32>>(3)?.unwrap_or(0),
+                filename: row.get(4)?,
+                file_size: row.get::<_, i64>(5)? as u64,
+                date_modified: row.get::<_, i64>(6)? as u64,
+                error: false,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Get photo mtime by file path (for incremental scan)
+    pub fn get_photo_mtime(&self, file_path: &str) -> SqlResult<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT date_modified_unix FROM photos WHERE path = ?1"
+        )?;
+        let mut rows = stmt.query([file_path])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(row.get(0)?));
+        }
+        Ok(None)
+    }
+
+    /// Upsert a photo record with thumbnail path and mtime
+    pub fn upsert_photo_with_thumb(
+        &self,
+        library_id: i64,
+        scanned: &crate::scan::ScannedFile,
+        thumb_path: &str,
+        thumb_w: u32,
+        thumb_h: u32,
+        mtime_unix: u64,
+    ) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"INSERT OR REPLACE INTO photos (
+                library_id, path, filename, folder_rel, taken_at, modified_at, media_type,
+                size_bytes, width, height, thumb_path, date_modified_unix,
+                camera_make, camera_model, lens, iso, shutter_speed, aperture,
+                focal_length, gps_lat, gps_lon
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
+            )"#,
+            rusqlite::params![
+                library_id,
+                scanned.path,
+                scanned.filename,
+                scanned.folder_rel,
+                scanned.taken_at,
+                scanned.modified_at,
+                scanned.media_type,
+                scanned.size_bytes,
+                thumb_w as i32,
+                thumb_h as i32,
+                thumb_path,
+                mtime_unix as i64,
+                scanned.camera_make,
+                scanned.camera_model,
+                scanned.lens,
+                scanned.iso,
+                scanned.shutter_speed,
+                scanned.aperture,
+                scanned.focal_length,
+                scanned.gps_lat,
+                scanned.gps_lon,
+            ],
+        )?;
+        Ok(())
     }
 }

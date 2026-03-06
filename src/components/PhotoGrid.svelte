@@ -20,6 +20,7 @@
         convertFileSource,
     } from "../lib/store";
     import type { Photo } from "../lib/store";
+    import { getCachedThumb, cacheThumb } from "../lib/thumbnailCache";
 
     $: columnCount = getColumnCount($appSettings.gridZoom);
 
@@ -59,15 +60,24 @@
         }
     }
 
-    /** Load a thumbnail for a photo — uses backend 320px JPEG cache.
-     *  Falls back to direct asset protocol if thumbnail fails. */
+    /** Load a thumbnail for a photo with LRU caching */
     async function getPhotoUrl(photo: Photo): Promise<string> {
+        // Check LRU cache first
+        const cached = getCachedThumb(photo.path);
+        if (cached) return cached;
+
         try {
             const thumbPath = await getThumbnail(photo.path);
-            if (thumbPath) return convertFileSource(thumbPath);
+            if (thumbPath) {
+                const url = convertFileSource(thumbPath);
+                cacheThumb(photo.path, url);
+                return url;
+            }
         } catch {}
         // Fallback: serve original via asset protocol
-        return convertFileSource(photo.path);
+        const fallback = convertFileSource(photo.path);
+        cacheThumb(photo.path, fallback);
+        return fallback;
     }
 
     function openPhoto(photo: Photo) {
@@ -98,10 +108,124 @@
         }
     }
 
-    // ── Viewport-Aware Lazy Loading (Single Shared Observer) ──
-    // One IntersectionObserver manages ALL cards, instead of one per card.
-    // Loads thumbnails (320px JPEG) when near viewport, unloads when far away.
+    // ── Virtual Scroll State ──
+    let scrollContainer: HTMLDivElement;
+    let containerWidth = 800;
+    let scrollTop = 0;
+    let containerHeight = 600;
 
+    // Flat list of renderable items (sections + rows of photos)
+    interface VirtualRow {
+        type: 'header' | 'photos';
+        height: number;
+        offsetTop: number;
+        // header fields
+        label?: string;
+        dateKey?: string;
+        count?: number;
+        // photos fields
+        photos?: Photo[];
+        groupDateKey?: string;
+    }
+
+    let virtualRows: VirtualRow[] = [];
+    let totalHeight = 0;
+    let visibleRows: VirtualRow[] = [];
+
+    // ── Build virtual rows from grouped photos ──
+    function buildVirtualRows(
+        groups: { label: string; dateKey: string; photos: Photo[] }[],
+        cols: number,
+        size: number,
+    ) {
+        const rows: VirtualRow[] = [];
+        const gap = $appSettings.layoutMode === 'compact' ? 2 : $appSettings.layoutMode === 'expressive' ? 6 : 4;
+        const headerHeight = $appSettings.layoutMode === 'compact' ? 30 : 40;
+        const sectionGap = $appSettings.layoutMode === 'compact' ? 8 : $appSettings.layoutMode === 'expressive' ? 0 : 32;
+        const rowHeight = size + gap;
+
+        const effectiveCols = $appSettings.layoutMode === 'expressive' ? 6 : cols;
+
+        let currentOffset = 0;
+
+        for (const group of groups) {
+            // Date header row
+            rows.push({
+                type: 'header',
+                height: headerHeight,
+                offsetTop: currentOffset,
+                label: group.label,
+                dateKey: group.dateKey,
+                count: group.photos.length,
+            });
+            currentOffset += headerHeight;
+
+            // Pack photos into rows
+            for (let i = 0; i < group.photos.length; i += effectiveCols) {
+                const chunk = group.photos.slice(i, i + effectiveCols);
+                rows.push({
+                    type: 'photos',
+                    height: rowHeight,
+                    offsetTop: currentOffset,
+                    photos: chunk,
+                    groupDateKey: group.dateKey,
+                });
+                currentOffset += rowHeight;
+            }
+
+            currentOffset += sectionGap;
+        }
+
+        return { rows, totalHeight: currentOffset };
+    }
+
+    // ── Compute visible rows ──
+    function computeVisibleRows() {
+        if (!virtualRows.length) {
+            visibleRows = [];
+            return;
+        }
+
+        const top = scrollTop;
+        const bottom = scrollTop + containerHeight;
+        const buffer = containerHeight; // 1 viewport buffer above/below
+
+        const bufferedTop = Math.max(0, top - buffer);
+        const bufferedBottom = bottom + buffer;
+
+        visibleRows = virtualRows.filter(row => {
+            const rowBottom = row.offsetTop + row.height;
+            return rowBottom > bufferedTop && row.offsetTop < bufferedBottom;
+        });
+    }
+
+    // Rebuild layout when data or settings change
+    $: {
+        const result = buildVirtualRows($groupedPhotos, columnCount, itemSize);
+        virtualRows = result.rows;
+        totalHeight = result.totalHeight;
+        // Recompute visible after layout change
+        computeVisibleRows();
+    }
+
+    // ── Scroll handler (rAF-throttled) ──
+    let rafId: number = 0;
+    function handleScroll() {
+        if (rafId) return;
+        rafId = requestAnimationFrame(() => {
+            rafId = 0;
+            if (!scrollContainer) return;
+            scrollTop = scrollContainer.scrollTop;
+            computeVisibleRows();
+
+            // Infinite scroll: load more when near bottom
+            if (scrollTop + containerHeight >= totalHeight - 600 && $hasMorePhotos && !$isLoadingMore) {
+                loadMorePhotos();
+            }
+        });
+    }
+
+    // ── Viewport-Aware Lazy Loading (Single Shared Observer) ──
     const cardPhotoMap = new Map<Element, Photo>();
     let lazyObserver: IntersectionObserver;
 
@@ -118,7 +242,6 @@
                             const photo = cardPhotoMap.get(card);
                             if (photo) {
                                 getPhotoUrl(photo).then((url) => {
-                                    // Only set if still observed (not destroyed)
                                     if (cardPhotoMap.has(card)) {
                                         img.src = url;
                                     }
@@ -140,7 +263,7 @@
                     }
                 }
             },
-            { rootMargin: "150% 0px 150% 0px" },
+            { root: scrollContainer, rootMargin: "150% 0px 150% 0px" },
         );
     }
 
@@ -156,45 +279,44 @@
         };
     }
 
-    // ── Infinite Scroll ──
-    let sentinel: HTMLDivElement;
-    let observer: IntersectionObserver;
+    // ── ResizeObserver ──
+    let resizeObserver: ResizeObserver;
 
     onMount(() => {
-        // Create the single shared lazy-load observer
         lazyObserver = createLazyObserver();
-        // Re-observe any cards already in the DOM
         cardPhotoMap.forEach((_, node) => lazyObserver.observe(node as Element));
 
-        observer = new IntersectionObserver(
-            (entries) => {
-                if (
-                    entries[0]?.isIntersecting &&
-                    $hasMorePhotos &&
-                    !$isLoadingMore
-                ) {
-                    loadMorePhotos();
-                }
-            },
-            { rootMargin: "600px" },
-        );
-        if (sentinel) observer.observe(sentinel);
+        if (scrollContainer) {
+            containerWidth = scrollContainer.clientWidth;
+            containerHeight = scrollContainer.clientHeight;
+            scrollContainer.addEventListener('scroll', handleScroll, { passive: true });
+        }
+
+        resizeObserver = new ResizeObserver((entries) => {
+            for (const entry of entries) {
+                containerWidth = entry.contentRect.width;
+                containerHeight = entry.contentRect.height;
+                // Rebuild layout on resize
+                const result = buildVirtualRows($groupedPhotos, columnCount, itemSize);
+                virtualRows = result.rows;
+                totalHeight = result.totalHeight;
+                computeVisibleRows();
+            }
+        });
+        if (scrollContainer) resizeObserver.observe(scrollContainer);
     });
 
     onDestroy(() => {
-        observer?.disconnect();
         lazyObserver?.disconnect();
+        resizeObserver?.disconnect();
         cardPhotoMap.clear();
+        if (scrollContainer) {
+            scrollContainer.removeEventListener('scroll', handleScroll);
+        }
+        if (rafId) cancelAnimationFrame(rafId);
     });
 
-    // Re-observe whenever the sentinel element is recreated by Svelte
-    $: if (sentinel && observer) {
-        observer.disconnect();
-        observer.observe(sentinel);
-    }
-
     // Expressive Tetris layout: aspect-aware spans with frequency limiting
-    // Only some wide/tall photos get expanded — keeps the grid balanced & natural
     let wideCount = 0;
     let tallCount = 0;
 
@@ -202,34 +324,22 @@
         if ($appSettings.layoutMode !== "expressive") return "";
         const aspect = getPhotoAspect(photo);
 
-        // Every 12th photo gets a featured 2×2 spotlight
         if (index > 0 && index % 12 === 0) return "span-lg";
-
-        // Ultra-wide panoramas always get hero treatment (rare)
         if (aspect > 2.5) return "span-hero";
 
-        // Wide landscape — only every 3rd one gets expanded
         if (aspect > 1.4) {
             wideCount++;
             if (wideCount % 3 === 1) return "span-wide";
-            return ""; // rest stay standard 1×1
+            return "";
         }
 
-        // Tall portrait — only every 3rd one gets expanded
         if (aspect < 0.7) {
             tallCount++;
             if (tallCount % 3 === 1) return "span-tall";
-            return ""; // rest stay standard 1×1
+            return "";
         }
 
-        // Standard photos
         return "";
-    }
-
-    // Disable heavy animations for large groups
-    function getAnimDelay(groupIdx: number, photoCount: number): string {
-        if (photoCount > 100) return "0s";
-        return `${groupIdx * 0.04}s`;
     }
 
     function handleImgError(e: Event) {
@@ -243,12 +353,45 @@
     function handleImgLoad(e: Event) {
         const target = e.currentTarget as HTMLImageElement | null;
         if (target) {
-            // Mark card as loaded to stop shimmer and hide placeholder
             const card = target.closest(".photo-card");
             if (card) card.classList.add("img-loaded");
         }
     }
+
+    // ── Keyboard Navigation ──
+    function handleKeydown(e: KeyboardEvent) {
+        if (!scrollContainer) return;
+        const step = itemSize + 4;
+        switch (e.key) {
+            case 'ArrowDown':
+                e.preventDefault();
+                scrollContainer.scrollTop += step;
+                break;
+            case 'ArrowUp':
+                e.preventDefault();
+                scrollContainer.scrollTop -= step;
+                break;
+            case 'PageDown':
+                e.preventDefault();
+                scrollContainer.scrollTop += containerHeight * 0.8;
+                break;
+            case 'PageUp':
+                e.preventDefault();
+                scrollContainer.scrollTop -= containerHeight * 0.8;
+                break;
+            case 'Home':
+                e.preventDefault();
+                scrollContainer.scrollTop = 0;
+                break;
+            case 'End':
+                e.preventDefault();
+                scrollContainer.scrollTop = totalHeight;
+                break;
+        }
+    }
 </script>
+
+<svelte:window on:keydown={handleKeydown} />
 
 <!-- svelte-ignore a11y-no-static-element-interactions -->
 <div
@@ -256,103 +399,111 @@
     class:layout-compact={$appSettings.layoutMode === "compact"}
     class:layout-expressive={$appSettings.layoutMode === "expressive"}
     on:wheel={handleWheel}
+    bind:this={scrollContainer}
 >
-    {#each $groupedPhotos as group, groupIdx (group.dateKey)}
-        <div
-            class="date-section"
-            style="animation-delay: {getAnimDelay(
-                groupIdx,
-                group.photos.length,
-            )}"
-        >
-            <div class="date-header-pill">
-                <h2 class="date-label">{group.label}</h2>
-                <span class="date-dot">·</span>
-                <span class="date-count">{group.photos.length}</span>
-            </div>
-
-            <div
-                class="photo-grid"
-                style="--col-count: {columnCount}; --item-size: {itemSize}px;"
-            >
-                {#each group.photos as photo, photoIdx (photo.id)}
-                    <button
-                        class="photo-card group relative {getSpanClass(
-                            photo,
-                            photoIdx,
-                        )}"
-                        class:selected={$selectedPhotoIds.has(photo.id)}
-                        on:click={() => openPhoto(photo)}
-                        title={photo.filename}
-                        use:lazyLoad={photo}
-                        style="aspect-ratio: {$appSettings.layoutMode ===
-                        'expressive'
-                            ? 'auto'
-                            : $appSettings.gridZoom >= 4
-                              ? getPhotoAspect(photo)
-                              : '1'};"
+    <!-- Virtual scroll wrapper — total height for correct scrollbar -->
+    <div class="virtual-scroll-spacer" style="height: {totalHeight}px; position: relative;">
+        {#each visibleRows as row (row.type === 'header' ? `h-${row.dateKey}` : `r-${row.groupDateKey}-${row.offsetTop}`)}
+            {#if row.type === 'header'}
+                <div
+                    class="date-section-header"
+                    style="position: absolute; top: {row.offsetTop}px; left: 0; right: 0; height: {row.height}px; padding: 0 var(--sp-5);"
+                >
+                    <div class="date-header-pill">
+                        <h2 class="date-label">{row.label}</h2>
+                        <span class="date-dot">·</span>
+                        <span class="date-count">{row.count}</span>
+                    </div>
+                </div>
+            {:else if row.photos}
+                <div
+                    class="photo-row"
+                    style="position: absolute; top: {row.offsetTop}px; left: 0; right: 0; height: {row.height}px; padding: 0 var(--sp-5); contain: layout style;"
+                >
+                    <div
+                        class="photo-grid"
+                        style="--col-count: {columnCount}; --item-size: {itemSize}px;"
                     >
-                        {#if $isMultiSelectMode}
-                            <div
-                                class="select-checkbox"
-                                class:checked={$selectedPhotoIds.has(photo.id)}
+                        {#each row.photos as photo, photoIdx (photo.id)}
+                            <button
+                                class="photo-card group relative {getSpanClass(
+                                    photo,
+                                    photoIdx,
+                                )}"
+                                class:selected={$selectedPhotoIds.has(photo.id)}
+                                on:click={() => openPhoto(photo)}
+                                title={photo.filename}
+                                use:lazyLoad={photo}
+                                style="aspect-ratio: {$appSettings.layoutMode ===
+                                'expressive'
+                                    ? 'auto'
+                                    : $appSettings.gridZoom >= 4
+                                      ? getPhotoAspect(photo)
+                                      : '1'};"
                             >
-                                {#if $selectedPhotoIds.has(photo.id)}
-                                    <svg
-                                        viewBox="0 0 24 24"
-                                        width="14"
-                                        height="14"
-                                        fill="white"
+                                {#if $isMultiSelectMode}
+                                    <div
+                                        class="select-checkbox"
+                                        class:checked={$selectedPhotoIds.has(photo.id)}
                                     >
-                                        <path
-                                            d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z"
-                                        />
-                                    </svg>
+                                        {#if $selectedPhotoIds.has(photo.id)}
+                                            <svg
+                                                viewBox="0 0 24 24"
+                                                width="14"
+                                                height="14"
+                                                fill="white"
+                                            >
+                                                <path
+                                                    d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z"
+                                                />
+                                            </svg>
+                                        {/if}
+                                    </div>
                                 {/if}
-                            </div>
-                        {/if}
 
-                        <div class="photo-thumb">
-                            <img
-                                class="lazy-photo"
-                                alt={photo.filename}
-                                loading="lazy"
-                                decoding="async"
-                                draggable="false"
-                                on:load={handleImgLoad}
-                                on:error={handleImgError}
-                            />
-                            <div class="placeholder">
-                                <span class="placeholder-icon"
-                                    >{@html icons.image || ""}</span
-                                >
-                            </div>
-                        </div>
-
-                        {#if photo.mediaType === "video"}
-                            <div class="badge-video">
-                                <span>▶</span>
-                            </div>
-                        {/if}
-                        {#if photo.isFavorite}
-                            <div class="badge-fav">
-                                <svg
-                                    width="16"
-                                    height="16"
-                                    viewBox="0 0 24 24"
-                                    fill="#ff2d55"
-                                >
-                                    <path
-                                        d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"
+                                <div class="photo-thumb">
+                                    <img
+                                        class="lazy-photo"
+                                        alt={photo.filename}
+                                        loading="lazy"
+                                        decoding="async"
+                                        draggable="false"
+                                        on:load={handleImgLoad}
+                                        on:error={handleImgError}
                                     />
-                                </svg>
-                            </div>
-                        {/if}
-                    </button>
-                {/each}
-            </div>
-        </div>
-    {/each}
+                                    <div class="placeholder">
+                                        <span class="placeholder-icon"
+                                            >{@html icons.image || ""}</span
+                                        >
+                                    </div>
+                                </div>
+
+                                {#if photo.mediaType === "video"}
+                                    <div class="badge-video">
+                                        <span>▶</span>
+                                    </div>
+                                {/if}
+                                {#if photo.isFavorite}
+                                    <div class="badge-fav">
+                                        <svg
+                                            width="16"
+                                            height="16"
+                                            viewBox="0 0 24 24"
+                                            fill="#ff2d55"
+                                        >
+                                            <path
+                                                d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"
+                                            />
+                                        </svg>
+                                    </div>
+                                {/if}
+                            </button>
+                        {/each}
+                    </div>
+                </div>
+            {/if}
+        {/each}
+    </div>
 
     {#if $filteredPhotos.length === 0}
         <div class="no-results">
@@ -363,13 +514,10 @@
         </div>
     {/if}
 
-    <!-- Infinite-scroll sentinel -->
-    {#if $hasMorePhotos}
-        <div class="scroll-sentinel" bind:this={sentinel}>
-            {#if $isLoadingMore}
-                <div class="load-more-spinner"></div>
-                <span class="load-more-text">Loading more photos…</span>
-            {/if}
+    {#if $isLoadingMore}
+        <div class="load-more-bar">
+            <div class="load-more-spinner"></div>
+            <span class="load-more-text">Loading more photos…</span>
         </div>
     {/if}
 </div>
@@ -380,14 +528,18 @@
         flex: 1;
         overflow-y: auto;
         overflow-x: hidden;
-        padding: var(--sp-4) var(--sp-5);
         scroll-behavior: smooth;
+        contain: strict;
+        will-change: scroll-position;
     }
 
-    .date-section {
-        margin-bottom: var(--sp-8);
-        animation: fadeInUp var(--duration-base) var(--ease-emphasized-decel)
-            backwards;
+    .virtual-scroll-spacer {
+        width: 100%;
+    }
+
+    .date-section-header {
+        display: flex;
+        align-items: center;
     }
 
     .date-header-pill {
@@ -395,17 +547,11 @@
         align-items: center;
         gap: 6px;
         padding: 6px 16px;
-        margin-bottom: var(--sp-3);
         position: sticky;
         top: 4px;
         z-index: 10;
         background: var(--md-sys-color-secondary-container);
-        backdrop-filter: blur(16px) saturate(1.4);
-        -webkit-backdrop-filter: blur(16px) saturate(1.4);
         border-radius: 20px;
-        box-shadow:
-            0 2px 8px rgba(0, 0, 0, 0.06),
-            inset 0 1px 0 rgba(255, 255, 255, 0.06);
         border: 1px solid rgba(255, 255, 255, 0.04);
     }
 
@@ -434,6 +580,11 @@
         display: grid;
         grid-template-columns: repeat(var(--col-count), 1fr);
         gap: 4px;
+        height: 100%;
+    }
+
+    .photo-row {
+        contain: layout style;
     }
 
     /* ── Photo Card ── */
@@ -444,16 +595,15 @@
         overflow: hidden;
         transition:
             transform var(--duration-fast) var(--ease-emphasized),
-            box-shadow var(--duration-fast) var(--ease-standard),
             border-radius var(--duration-fast) var(--ease-standard);
-        /* Removed will-change: transform — promoting hundreds of layers kills GPU memory */
     }
 
     .photo-card:hover {
         transform: scale(1.02);
-        box-shadow: var(--shadow-lg);
         z-index: 5;
         border-radius: var(--radius-xl);
+        outline: 2px solid var(--accent-subtle);
+        outline-offset: -2px;
     }
 
     .photo-card:active {
@@ -499,11 +649,10 @@
         transition: opacity var(--duration-base) var(--ease-standard);
     }
 
-    /* Fade out and stop placeholder once image has loaded */
     .photo-card.img-loaded .placeholder {
         opacity: 0;
         pointer-events: none;
-        animation: none; /* Stop shimmer to free up compositor */
+        animation: none;
     }
 
     .placeholder-icon {
@@ -516,18 +665,16 @@
         height: 24px;
     }
 
-    /* ── Badges ── */
+    /* ── Badges (no backdrop-filter — solid bg for perf) ── */
     .badge-video {
         position: absolute;
         bottom: 8px;
         left: 8px;
         background: var(--md-sys-color-surface-container-high);
-        backdrop-filter: blur(8px);
         border-radius: var(--radius-full);
         padding: 4px 8px;
         font-size: 11px;
         color: var(--md-sys-color-on-surface);
-        box-shadow: var(--shadow-sm);
         z-index: 3;
     }
 
@@ -536,10 +683,8 @@
         top: 8px;
         right: 8px;
         background: var(--md-sys-color-surface-container-high);
-        backdrop-filter: blur(8px);
         border-radius: var(--radius-full);
         padding: 4px;
-        box-shadow: var(--shadow-sm);
         z-index: 3;
     }
 
@@ -562,11 +707,6 @@
 
     .layout-compact .date-header-pill {
         padding: 4px 12px;
-        margin-bottom: 2px;
-    }
-
-    .layout-compact .date-section {
-        margin-bottom: var(--sp-2);
     }
 
     /* ── Expressive Mode — Tetris-style Tessellating Layout ── */
@@ -583,11 +723,6 @@
         padding: 6px;
     }
 
-    .layout-expressive .date-section {
-        margin-bottom: 0;
-    }
-
-    /* Floating glassmorphic date pill */
     .layout-expressive .date-header-pill {
         display: inline-flex;
         position: sticky;
@@ -595,12 +730,9 @@
         z-index: 20;
         margin: 8px 12px;
         padding: 6px 16px;
-        background: rgba(0, 0, 0, 0.45);
-        backdrop-filter: blur(16px) saturate(1.4);
-        -webkit-backdrop-filter: blur(16px) saturate(1.4);
+        background: var(--md-sys-color-secondary-container);
         border-radius: var(--radius-full);
         border: 1px solid rgba(255, 255, 255, 0.1);
-        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
     }
 
     .layout-expressive .date-header-pill .date-label,
@@ -657,37 +789,30 @@
     }
 
     /* ── Tetris span classes ── */
-    /* Hero: 3 cols × 2 rows — big cinematic banner */
     .layout-expressive .span-hero {
         grid-column: span 3;
         grid-row: span 2;
     }
 
-    /* Large square: 2 cols × 2 rows */
     .layout-expressive .span-lg {
         grid-column: span 2;
         grid-row: span 2;
     }
 
-    /* Wide landscape: 2 cols × 1 row */
     .layout-expressive .span-wide {
         grid-column: span 2;
     }
 
-    /* Tall portrait: 1 col × 2 rows */
     .layout-expressive .span-tall {
         grid-row: span 2;
     }
 
-    /* Legacy compat */
     .layout-expressive .span-featured {
         grid-column: span 3;
         grid-row: span 2;
     }
 
-    /* Expressive entrance: fade-in on load instead of on DOM mount.
-       The .img-loaded class is added when the thumbnail finishes loading,
-       so animations are naturally staggered and never storm on mount. */
+    /* Expressive entrance: fade-in on load */
     .layout-expressive .photo-card .lazy-photo {
         opacity: 0;
         transform: scale(0.97);
@@ -748,14 +873,15 @@
         border-color: var(--accent);
     }
 
-    /* ── Infinite Scroll Sentinel ── */
-    .scroll-sentinel {
+    /* ── Load More ── */
+    .load-more-bar {
         display: flex;
         align-items: center;
         justify-content: center;
         gap: var(--sp-3);
         padding: var(--sp-8) 0;
-        min-height: 1px;
+        position: sticky;
+        bottom: 0;
     }
 
     .load-more-spinner {

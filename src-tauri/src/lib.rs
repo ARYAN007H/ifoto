@@ -3,6 +3,7 @@ pub mod image_processing;
 mod db;
 mod scan;
 mod thumb;
+mod watcher;
 
 
 
@@ -59,6 +60,9 @@ pub fn run() {
             // Image processing
             image_processing::process_image,
             image_processing::compute_histogram,
+            // Performance & streaming
+            commands::scan_directory,
+            commands::get_system_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

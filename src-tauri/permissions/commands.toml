@@ -187,3 +187,13 @@ commands.allow = ["process_image"]
 identifier = "compute-histogram"
 description = "Compute histogram"
 commands.allow = ["compute_histogram"]
+
+[[permission]]
+identifier = "scan-directory"
+description = "Scan directory with streaming events"
+commands.allow = ["scan_directory"]
+
+[[permission]]
+identifier = "get-system-info"
+description = "Get system info for performance mode"
+commands.allow = ["get_system_info"]

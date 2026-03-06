@@ -245,6 +245,39 @@
                                 </span>
                             </label>
                         </div>
+
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <span class="setting-icon"
+                                    >{@html icons.settings}</span
+                                >
+                                <div>
+                                    <p class="setting-label">Performance Mode</p>
+                                    <p class="setting-desc">
+                                        Reduces animations for smoother experience on lower-end hardware
+                                    </p>
+                                    {#if $appSettings.performanceModeAuto}
+                                        <span class="perf-chip">Auto-enabled</span>
+                                    {:else if $appSettings.performanceMode}
+                                        <span class="perf-chip manual">Manual</span>
+                                    {/if}
+                                </div>
+                            </div>
+                            <label class="toggle-switch">
+                                <input
+                                    type="checkbox"
+                                    checked={$appSettings.performanceMode}
+                                    on:change={(e) =>
+                                        updateSettings({
+                                            performanceMode: e.currentTarget.checked,
+                                            performanceModeAuto: false,
+                                        })}
+                                />
+                                <span class="toggle-track">
+                                    <span class="toggle-thumb"></span>
+                                </span>
+                            </label>
+                        </div>
                     </div>
 
                     <div class="settings-group">
@@ -1300,6 +1333,25 @@
         border-radius: var(--radius-sm);
         font-family: var(--font-mono);
         font-size: 11px;
+        color: var(--text-secondary);
+    }
+
+    /* ── Performance Mode Chip ── */
+    .perf-chip {
+        display: inline-flex;
+        align-items: center;
+        margin-top: 4px;
+        padding: 2px 10px;
+        border-radius: var(--radius-full);
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        background: var(--accent-subtle);
+        color: var(--accent-text);
+    }
+
+    .perf-chip.manual {
+        background: var(--md-sys-color-surface-container-highest);
         color: var(--text-secondary);
     }
 </style>

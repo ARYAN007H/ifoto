@@ -1,5 +1,6 @@
 use crate::db::Database;
 use crate::scan;
+use crate::thumb;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -208,8 +209,8 @@ pub async fn search_photos(
 }
 
 #[tauri::command]
-pub async fn get_thumbnail_path(app: AppHandle, source_path: String) -> Result<String, String> {
-    let path = crate::thumb::get_or_create_thumbnail(&app, &source_path).await?;
+pub async fn get_thumbnail_path(source_path: String) -> Result<String, String> {
+    let path = thumb::get_or_create_thumbnail(&source_path).await?;
     Ok(path.to_string_lossy().to_string())
 }
 
@@ -734,4 +735,223 @@ pub async fn save_edited_photo(
     std::fs::write(&target_path, &bytes)
         .map_err(|e| format!("Failed to write file: {}", e))?;
     Ok(target_path)
+}
+
+// ── Streaming Directory Scan ──
+
+/// Streaming scan_directory command: returns immediately, emits events progressively
+#[tauri::command]
+pub async fn scan_directory(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    dir_path: String,
+) -> Result<(), String> {
+    let path = std::path::PathBuf::from(&dir_path);
+    if !path.exists() || !path.is_dir() {
+        return Err("Invalid or missing directory".to_string());
+    }
+    let dir_str = path.to_string_lossy().to_string();
+
+    // Ensure DB is open
+    let db_path = db_path(&app);
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    // Get or create DB + library
+    let db = {
+        let db_guard = state.db.lock().unwrap();
+        if db_guard.is_some() {
+            drop(db_guard);
+            // DB already open
+            None
+        } else {
+            drop(db_guard);
+            Some(Database::new(&db_path).map_err(|e| e.to_string())?)
+        }
+    };
+
+    if let Some(new_db) = db {
+        *state.db.lock().unwrap() = Some(new_db);
+    }
+
+    let app_clone = app.clone();
+    let state_db = state.db.lock().unwrap();
+    let db_ref = state_db.as_ref().ok_or("No database")?;
+    let _library_id = db_ref.get_or_create_library(&dir_str).map_err(|e| e.to_string())?;
+
+    // Phase 1: Check hot cache (directory scanned < 60s ago)
+    if let Ok(Some(last_scanned)) = db_ref.get_directory_scan_time(&dir_str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if now - last_scanned < 60 {
+            // Hot cache hit — load from DB and emit immediately
+            if let Ok(cached) = db_ref.get_cached_photos_for_dir(&dir_str) {
+                let total = cached.len();
+                drop(state_db); // Release lock before emitting
+
+                let _ = app_clone.emit("scan-started", serde_json::json!({
+                    "total": total,
+                    "dirPath": dir_str,
+                    "cached": true
+                }));
+
+                for info in &cached {
+                    let _ = app_clone.emit("thumb-ready", info);
+                }
+
+                let _ = app_clone.emit("scan-complete", serde_json::json!({
+                    "total": total,
+                    "errors": 0
+                }));
+
+                eprintln!("  ⚡ Hot cache hit for {} ({} photos)", dir_str, total);
+                return Ok(());
+            }
+        }
+    }
+    drop(state_db); // Release lock before async scanning
+
+    // Phase 2: Full scan with progressive streaming
+    let dir_str_clone = dir_str.clone();
+    let db_path_clone = db_path.clone();
+
+    tauri::async_runtime::spawn(async move {
+        // Collect file paths first (fast)
+        let paths = scan::collect_media_paths(&std::path::PathBuf::from(&dir_str_clone));
+        let total = paths.len();
+
+        let _ = app_clone.emit("scan-started", serde_json::json!({
+            "total": total,
+            "dirPath": dir_str_clone,
+            "cached": false
+        }));
+
+        let root = std::path::PathBuf::from(&dir_str_clone)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(&dir_str_clone));
+
+        // Open a separate DB connection for the background task
+        let bg_db = match Database::new(&db_path_clone) {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("  ⚠ Failed to open DB for scan: {}", e);
+                let _ = app_clone.emit("scan-complete", serde_json::json!({
+                    "total": 0,
+                    "errors": 1
+                }));
+                return;
+            }
+        };
+
+        let library_id = match bg_db.get_or_create_library(&dir_str_clone) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("  ⚠ Failed to get library: {}", e);
+                return;
+            }
+        };
+
+        let mut errors = 0usize;
+
+        for path in &paths {
+            let path_str = path.to_string_lossy().to_string();
+            let current_mtime = thumb::file_mtime(path);
+
+            // Check if file is unchanged in DB
+            if let Ok(Some(stored_mtime)) = bg_db.get_photo_mtime(&path_str) {
+                if stored_mtime as u64 == current_mtime {
+                    // File unchanged — emit cached info
+                    let thumb_path = thumb::thumbnail_path_for(&path_str)
+                        .unwrap_or_default();
+                    if thumb_path.exists() {
+                        let filename = path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                        let info = thumb::ThumbnailInfo {
+                            original_path: path_str,
+                            thumb_path: thumb_path.to_string_lossy().to_string(),
+                            width: 0,
+                            height: 0,
+                            filename,
+                            file_size,
+                            date_modified: current_mtime,
+                            error: false,
+                        };
+                        let _ = app_clone.emit("thumb-ready", &info);
+                        continue;
+                    }
+                }
+            }
+
+            // Need to generate/regenerate thumbnail
+            let scanned = scan::build_scanned_file_light(path, &root);
+
+            let info = thumb::get_or_create_thumbnail_info(
+                &path_str,
+                Some(current_mtime),
+            ).await;
+
+            if info.error {
+                errors += 1;
+            } else {
+                // Update DB with new thumbnail info
+                if let Some(ref sf) = scanned {
+                    let _ = bg_db.upsert_photo_with_thumb(
+                        library_id,
+                        sf,
+                        &info.thumb_path,
+                        info.width,
+                        info.height,
+                        current_mtime,
+                    );
+                }
+            }
+
+            let _ = app_clone.emit("thumb-ready", &info);
+        }
+
+        // Update directory cache
+        let _ = bg_db.upsert_directory(&dir_str_clone, total as i64);
+
+        let _ = app_clone.emit("scan-complete", serde_json::json!({
+            "total": total,
+            "errors": errors
+        }));
+
+        eprintln!("  ✓ Scan complete: {} photos, {} errors", total, errors);
+    });
+
+    Ok(())
+}
+
+// ── System Info (for Performance Mode) ──
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemInfo {
+    pub total_ram_mb: u64,
+    pub available_ram_mb: u64,
+    pub cpu_threads: usize,
+    pub cpu_name: String,
+}
+
+#[tauri::command]
+pub async fn get_system_info() -> Result<SystemInfo, String> {
+    use sysinfo::System;
+    let mut sys = System::new_all();
+    sys.refresh_all();
+
+    Ok(SystemInfo {
+        total_ram_mb: sys.total_memory() / 1024 / 1024,
+        available_ram_mb: sys.available_memory() / 1024 / 1024,
+        cpu_threads: num_cpus::get(),
+        cpu_name: sys.cpus().first()
+            .map(|c| c.brand().to_string())
+            .unwrap_or_else(|| "Unknown".to_string()),
+    })
 }

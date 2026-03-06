@@ -48,6 +48,8 @@
     "save-edited-photo",
     "get-photo-count",
     "process-image",
-    "compute-histogram"
+    "compute-histogram",
+    "scan-directory",
+    "get-system-info"
   ]
 }

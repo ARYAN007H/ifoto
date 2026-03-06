@@ -28,6 +28,11 @@ rayon = "1"
 image = "0.25"
 rexif = "0.7"
 base64 = "0.22"
+num_cpus = "1.16"
+sha2 = "0.10"
+hex = "0.4"
+sysinfo = "0.30"
+notify = "6"
 
 [features]
 default = ["custom-protocol"]

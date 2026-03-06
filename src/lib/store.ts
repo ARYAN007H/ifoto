@@ -84,6 +84,8 @@ export interface AppSettings {
     hiddenFolders: string[]
     pinnedFolders: string[]
     maxVisibleFolders: number
+    performanceMode: boolean
+    performanceModeAuto: boolean
 }
 
 // ── Settings Persistence ──
@@ -107,6 +109,8 @@ const defaultSettings: AppSettings = {
     hiddenFolders: [],
     pinnedFolders: [],
     maxVisibleFolders: 8,
+    performanceMode: false,
+    performanceModeAuto: false,
 }
 
 function saveSettings(s: AppSettings) {
@@ -551,6 +555,23 @@ export async function initAutoScan() {
         // NO libraries in DB — show EmptyState, let user import
     } catch (err) {
         console.error('Failed to initialize:', err)
+    }
+
+    // Auto-detect performance mode
+    try {
+        const sysInfo = await invoke<{ totalRamMb: number; availableRamMb: number; cpuThreads: number; cpuName: string }>('get_system_info')
+        const current = get(appSettings)
+        // Auto-enable if RAM < 6GB or CPU threads <= 4, unless manually overridden
+        if (!current.performanceMode && (sysInfo.availableRamMb < 6144 || sysInfo.cpuThreads <= 4)) {
+            appSettings.update(s => ({
+                ...s,
+                performanceMode: true,
+                performanceModeAuto: true,
+            }))
+            console.log(`[PerfMode] Auto-enabled: RAM ${sysInfo.availableRamMb}MB, ${sysInfo.cpuThreads} threads (${sysInfo.cpuName})`)
+        }
+    } catch (err) {
+        console.warn('Failed to get system info for perf mode:', err)
     }
 }
 

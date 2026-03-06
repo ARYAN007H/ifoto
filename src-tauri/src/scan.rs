@@ -259,6 +259,54 @@ pub fn process_paths_batch(paths: &[PathBuf], root: &Path) -> Vec<ScannedFile> {
         .collect()
 }
 
+/// Light version of build_scanned_file — skips expensive image dimension reading.
+/// Dimensions come from thumbnail generation instead.
+pub fn build_scanned_file_light(path: &Path, root: &Path) -> Option<ScannedFile> {
+    let path_str = path.to_string_lossy().to_string();
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+    let folder_rel = path
+        .parent()
+        .and_then(|p| p.strip_prefix(root).ok())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let media_type = media_type_from_path(path).to_string();
+    let size_bytes = std::fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0);
+    let modified_at = modified_time_string(path);
+
+    let exif = if media_type == "photo" {
+        parse_exif_data(path)
+    } else {
+        ExifData::default()
+    };
+
+    // Skip dimensions — they'll come from thumbnail generation
+    Some(ScannedFile {
+        path: path_str,
+        filename,
+        folder_rel,
+        taken_at: exif.taken_at.or_else(|| Some(modified_at.clone())),
+        modified_at,
+        media_type,
+        size_bytes,
+        width: None,
+        height: None,
+        camera_make: exif.camera_make,
+        camera_model: exif.camera_model,
+        lens: exif.lens,
+        iso: exif.iso,
+        shutter_speed: exif.shutter_speed,
+        aperture: exif.aperture,
+        focal_length: exif.focal_length,
+        gps_lat: exif.gps_lat,
+        gps_lon: exif.gps_lon,
+    })
+}
+
 #[allow(dead_code)]
 pub fn scan_directory(root: &Path) -> Vec<ScannedFile> {
     let paths = collect_media_paths(root);
@@ -268,3 +316,4 @@ pub fn scan_directory(root: &Path) -> Vec<ScannedFile> {
         .filter_map(|path| build_scanned_file(path, &root))
         .collect()
 }
+

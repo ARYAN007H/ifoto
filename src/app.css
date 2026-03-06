@@ -811,3 +811,51 @@ a {
     --accent-text: var(--md-sys-color-primary);
     --accent-glow: rgba(0, 101, 144, 0.12);
 }
+
+/* ══════════════════════════════════════════
+   Performance Mode — Reduced Animations
+   Activated via body[data-perf-mode="true"]
+   ══════════════════════════════════════════ */
+body[data-perf-mode="true"] *,
+body[data-perf-mode="true"] *::before,
+body[data-perf-mode="true"] *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.05s !important;
+}
+
+body[data-perf-mode="true"] {
+    --duration-instant: 0ms;
+    --duration-fast: 50ms;
+    --duration-base: 50ms;
+    --duration-slow: 100ms;
+    --duration-slower: 100ms;
+    --duration-emphasized: 100ms;
+}
+
+/* Disable shimmer placeholders */
+body[data-perf-mode="true"] .placeholder {
+    animation: none !important;
+    background-size: 100% 100% !important;
+}
+
+/* Disable backdrop-filter everywhere */
+body[data-perf-mode="true"] [style*="backdrop-filter"],
+body[data-perf-mode="true"] .date-header-pill,
+body[data-perf-mode="true"] .bottom-pill {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+}
+
+/* Disable hover scale on grid cards */
+body[data-perf-mode="true"] .photo-card:hover {
+    transform: none !important;
+}
+
+/* Simplify shadows */
+body[data-perf-mode="true"] {
+    --shadow-lg: var(--shadow-sm);
+    --shadow-xl: var(--shadow-md);
+    --shadow-float: var(--shadow-md);
+    --shadow-glow: none;
+}
