@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod image_processing;
 mod db;
 mod scan;
 mod thumb;
@@ -55,6 +56,9 @@ pub fn run() {
             commands::get_album_photos,
             // Photo editor
             commands::save_edited_photo,
+            // Image processing
+            image_processing::process_image,
+            image_processing::compute_histogram,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

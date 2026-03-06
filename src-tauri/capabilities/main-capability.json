@@ -46,6 +46,8 @@
     "remove-from-album",
     "get-album-photos",
     "save-edited-photo",
-    "get-photo-count"
+    "get-photo-count",
+    "process-image",
+    "compute-histogram"
   ]
 }

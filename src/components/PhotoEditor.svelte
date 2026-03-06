@@ -1,51 +1,38 @@
 <script lang="ts">
     import { onMount, onDestroy } from "svelte";
-    import { icons } from "../lib/icons";
     import {
         selectedPhoto,
-        showInfoPanel,
         convertFileSource,
         invokeCommand,
     } from "../lib/store";
+    import EditingSidebar from "../lib/editing/EditingSidebar.svelte";
     import {
-        type AdjustmentValues,
+        type AdjustmentState,
+        defaultAdjustments,
+        cloneAdjustments,
+    } from "../lib/editing/adjustments";
+    import {
+        processImage,
+        processImageFull,
+        computeHistogram,
+        type HistogramData,
+    } from "../lib/editing/imageProcessor";
+    import {
         type CropState,
         type DrawStroke,
-        type FilterPreset,
-        defaultAdjustments,
-        filterPresets,
-        adjustmentSliders,
-        aspectRatios,
-        applyAdjustments,
         renderStrokes,
         canvasToBase64,
     } from "../lib/imageProcessing";
 
     export let onClose: () => void;
 
-    type EditorMode = "adjust" | "filters" | "crop" | "markup";
-    let activeMode: EditorMode = "adjust";
-
     // State
-    let adjustments: AdjustmentValues = { ...defaultAdjustments };
-    let activeFilter: string = "original";
-    let cropState: CropState = {
-        x: 0,
-        y: 0,
-        width: 0,
-        height: 0,
-        rotation: 0,
-        flipH: false,
-        flipV: false,
-        aspectRatio: null,
-    };
-    let strokes: DrawStroke[] = [];
-    let isDrawing = false;
-    let drawTool: "pen" | "highlighter" | "pencil" = "pen";
-    let drawColor = "#ff3b30";
-    let drawSize = 4;
+    let adjustments: AdjustmentState = cloneAdjustments(defaultAdjustments);
+    let histogramData: HistogramData | null = null;
+    let showOriginal = false;
     let saving = false;
     let hasChanges = false;
+    let imagePath = '';
 
     // Canvas refs
     let canvasEl: HTMLCanvasElement;
@@ -56,34 +43,21 @@
     let imgW = 0;
     let imgH = 0;
 
-    // Undo stack
-    let undoStack: {
-        adj: AdjustmentValues;
-        filter: string;
-        strokes: DrawStroke[];
-    }[] = [];
+    // Original image data for before/after
+    let originalImageData: ImageData | null = null;
 
-    const drawColors = [
-        "#ff3b30",
-        "#ff9500",
-        "#ffcc00",
-        "#34c759",
-        "#007aff",
-        "#5856d6",
-        "#af52de",
-        "#000000",
-        "#ffffff",
-    ];
+    // Undo
+    let undoStack: AdjustmentState[] = [];
 
     onMount(async () => {
         if (!$selectedPhoto) return;
 
+        imagePath = $selectedPhoto.path;
         sourceImg = new Image();
         sourceImg.crossOrigin = "anonymous";
         sourceImg.onload = () => {
             imgW = sourceImg.naturalWidth;
             imgH = sourceImg.naturalHeight;
-            cropState = { ...cropState, width: imgW, height: imgH };
 
             // Create source canvas
             sourceCanvas = document.createElement("canvas");
@@ -92,22 +66,29 @@
             const sctx = sourceCanvas.getContext("2d")!;
             sctx.drawImage(sourceImg, 0, 0);
 
+            // Get original image data for before/after & initial histogram
+            originalImageData = sctx.getImageData(0, 0, imgW, imgH);
+            histogramData = computeHistogram(originalImageData);
+
             // Setup display canvas
             canvasEl.width = imgW;
             canvasEl.height = imgH;
             ctx = canvasEl.getContext("2d")!;
             imageLoaded = true;
-            renderPreview();
+
+            // Initial render: show the unprocessed image first
+            ctx.drawImage(sourceCanvas, 0, 0);
+
+            // Then trigger the Rust pipeline for initial view
+            triggerProcess(true);
         };
         sourceImg.onerror = () => {
             console.error("Failed to load image for editor");
-            imageLoaded = true; // stop spinner, will show empty canvas
+            imageLoaded = true;
         };
 
-        // Load directly — no IPC thumbnail generation needed
         sourceImg.src = convertFileSource($selectedPhoto.path);
 
-        // Safety timeout: if image doesn't load in 10s, stop spinner
         setTimeout(() => {
             if (!imageLoaded) {
                 console.warn("Editor image load timed out");
@@ -116,142 +97,88 @@
         }, 10000);
     });
 
-    function renderPreview() {
-        if (!ctx || !sourceCanvas) return;
-        // Apply adjustments
-        applyAdjustments(ctx, sourceCanvas, adjustments, imgW, imgH);
-        // Render markup strokes
-        if (strokes.length > 0) {
-            renderStrokes(ctx, strokes);
+    async function triggerProcess(preview: boolean = true) {
+        if (!imagePath) return;
+
+        const result = await processImage(imagePath, adjustments, preview, preview ? 80 : 0);
+        if (result && ctx) {
+            // If preview resolution differs from canvas, we need to scale
+            if (result.width !== canvasEl.width || result.height !== canvasEl.height) {
+                // Draw preview scaled to full canvas
+                const tempCanvas = document.createElement('canvas');
+                tempCanvas.width = result.width;
+                tempCanvas.height = result.height;
+                const tempCtx = tempCanvas.getContext('2d')!;
+                tempCtx.putImageData(result, 0, 0);
+                ctx.drawImage(tempCanvas, 0, 0, canvasEl.width, canvasEl.height);
+            } else {
+                ctx.putImageData(result, 0, 0);
+            }
+
+            // Update histogram
+            histogramData = computeHistogram(result);
         }
     }
 
-    function pushUndo() {
-        undoStack = [
-            ...undoStack,
-            {
-                adj: { ...adjustments },
-                filter: activeFilter,
-                strokes: strokes.map((s) => ({ ...s, points: [...s.points] })),
-            },
-        ];
+    async function triggerFullRes() {
+        if (!imagePath) return;
+        const result = await processImageFull(imagePath, adjustments);
+        if (result && ctx) {
+            if (result.width !== canvasEl.width || result.height !== canvasEl.height) {
+                canvasEl.width = result.width;
+                canvasEl.height = result.height;
+            }
+            ctx.putImageData(result, 0, 0);
+            histogramData = computeHistogram(result);
+        }
+    }
+
+    function onAdjustmentChange(e: CustomEvent<Partial<AdjustmentState>>) {
+        undoStack = [...undoStack, cloneAdjustments(adjustments)];
+        adjustments = { ...adjustments, ...e.detail };
         hasChanges = true;
+        triggerProcess(true);
+    }
+
+    function onResetAll() {
+        undoStack = [...undoStack, cloneAdjustments(adjustments)];
+        adjustments = cloneAdjustments(defaultAdjustments);
+        hasChanges = false;
+        triggerProcess(true);
+    }
+
+    function onBeforeAfter(e: CustomEvent<boolean>) {
+        showOriginal = e.detail;
+        if (showOriginal && originalImageData && ctx) {
+            ctx.putImageData(originalImageData, 0, 0);
+        } else {
+            triggerProcess(true);
+        }
     }
 
     function undo() {
         if (undoStack.length === 0) return;
-        const prev = undoStack[undoStack.length - 1];
+        adjustments = undoStack[undoStack.length - 1];
         undoStack = undoStack.slice(0, -1);
-        adjustments = { ...prev.adj };
-        activeFilter = prev.filter;
-        strokes = prev.strokes;
-        renderPreview();
+        triggerProcess(true);
         if (undoStack.length === 0) hasChanges = false;
     }
 
     function resetAll() {
-        pushUndo();
-        adjustments = { ...defaultAdjustments };
-        activeFilter = "original";
-        strokes = [];
-        renderPreview();
+        onResetAll();
     }
 
-    // ── Adjustment handlers ──
-
-    function onSliderChange(key: keyof AdjustmentValues, value: number) {
-        pushUndo();
-        adjustments = { ...adjustments, [key]: value };
-        renderPreview();
-    }
-
-    // ── Filter handlers ──
-
-    function applyFilter(filter: FilterPreset) {
-        pushUndo();
-        activeFilter = filter.id;
-        if (filter.id === "original") {
-            adjustments = { ...defaultAdjustments };
-        } else {
-            adjustments = { ...defaultAdjustments, ...filter.adjustments };
-        }
-        renderPreview();
-    }
-
-    // ── Crop handlers ──
-
-    function rotate90() {
-        pushUndo();
-        cropState = { ...cropState, rotation: (cropState.rotation + 90) % 360 };
-        renderPreview();
-    }
-
-    function flipHorizontal() {
-        pushUndo();
-        cropState = { ...cropState, flipH: !cropState.flipH };
-        renderPreview();
-    }
-
-    function flipVertical() {
-        pushUndo();
-        cropState = { ...cropState, flipV: !cropState.flipV };
-        renderPreview();
-    }
-
-    function setAspectRatio(ratio: number | null) {
-        cropState = { ...cropState, aspectRatio: ratio };
-    }
-
-    // ── Markup handlers ──
-
-    function startDraw(e: MouseEvent) {
-        if (activeMode !== "markup") return;
-        isDrawing = true;
-        const rect = canvasEl.getBoundingClientRect();
-        const scaleX = imgW / rect.width;
-        const scaleY = imgH / rect.height;
-        const x = (e.clientX - rect.left) * scaleX;
-        const y = (e.clientY - rect.top) * scaleY;
-        pushUndo();
-        strokes = [
-            ...strokes,
-            {
-                tool: drawTool,
-                color: drawColor,
-                size: drawSize,
-                points: [{ x, y }],
-            },
-        ];
-    }
-
-    function moveDraw(e: MouseEvent) {
-        if (!isDrawing || activeMode !== "markup") return;
-        const rect = canvasEl.getBoundingClientRect();
-        const scaleX = imgW / rect.width;
-        const scaleY = imgH / rect.height;
-        const x = (e.clientX - rect.left) * scaleX;
-        const y = (e.clientY - rect.top) * scaleY;
-        const last = strokes[strokes.length - 1];
-        last.points.push({ x, y });
-        strokes = [...strokes];
-        renderPreview();
-    }
-
-    function endDraw() {
-        isDrawing = false;
-    }
-
-    // ── Save ──
-
+    // Save
     async function handleSave() {
         if (!$selectedPhoto || !canvasEl) return;
         saving = true;
         try {
+            // Process at full resolution before saving
+            await triggerFullRes();
+
             const base64 = canvasToBase64(canvasEl, "image/jpeg", 0.95);
-            // Strip the data:image/jpeg;base64, prefix
             const data = base64.split(",")[1];
             const originalPath = $selectedPhoto.path;
-            // Save as _edited copy next to original
             const ext = originalPath.split(".").pop() || "jpg";
             const baseName = originalPath.replace(`.${ext}`, "");
             const savePath = `${baseName}_edited.${ext}`;
@@ -270,14 +197,24 @@
         if (e.key === "Escape") onClose();
         if (e.key === "z" && (e.ctrlKey || e.metaKey)) undo();
     }
+
+    // Handle pointer release for full-res processing
+    function handlePointerUp() {
+        if (hasChanges) {
+            triggerFullRes();
+        }
+    }
 </script>
 
-<svelte:window on:keydown={handleKeydown} />
+<svelte:window on:keydown={handleKeydown} on:pointerup={handlePointerUp} />
 
 <div class="editor-overlay">
     <!-- Top bar -->
     <header class="editor-header">
-        <button class="editor-btn cancel" on:click={onClose}>Cancel</button>
+        <button class="editor-btn cancel" on:click={onClose}>
+            <span class="btn-icon">✕</span>
+            <span>Cancel</span>
+        </button>
         <div class="editor-title">Edit Photo</div>
         <div class="editor-actions">
             <button
@@ -286,25 +223,8 @@
                 disabled={undoStack.length === 0}
                 title="Undo (Ctrl+Z)"
             >
-                <svg
-                    width="18"
-                    height="18"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                >
-                    <polyline points="1 4 1 10 7 10"></polyline>
-                    <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path>
-                </svg>
+                ↩ Undo
             </button>
-            <button
-                class="editor-btn"
-                on:click={resetAll}
-                disabled={!hasChanges}>Reset</button
-            >
             <button
                 class="editor-btn save"
                 on:click={handleSave}
@@ -315,242 +235,52 @@
         </div>
     </header>
 
-    <!-- Main canvas area -->
-    <div class="editor-canvas-area">
-        {#if !imageLoaded}
-            <div class="editor-loading">
-                <div class="loading-spinner"></div>
-                <span>Loading image…</span>
-            </div>
-        {/if}
-        <canvas
-            bind:this={canvasEl}
-            class="editor-canvas"
-            class:drawing={activeMode === "markup"}
-            on:mousedown={startDraw}
-            on:mousemove={moveDraw}
-            on:mouseup={endDraw}
-            on:mouseleave={endDraw}
-        ></canvas>
-    </div>
-
-    <!-- Bottom panel -->
-    <div class="editor-bottom">
-        <!-- Mode tabs -->
-        <nav class="mode-tabs">
-            <button
-                class="mode-tab"
-                class:active={activeMode === "adjust"}
-                on:click={() => (activeMode = "adjust")}
-            >
-                <span class="mode-icon">☀</span>
-                <span>Adjust</span>
-            </button>
-            <button
-                class="mode-tab"
-                class:active={activeMode === "filters"}
-                on:click={() => (activeMode = "filters")}
-            >
-                <span class="mode-icon">◈</span>
-                <span>Filters</span>
-            </button>
-            <button
-                class="mode-tab"
-                class:active={activeMode === "crop"}
-                on:click={() => (activeMode = "crop")}
-            >
-                <span class="mode-icon">⬔</span>
-                <span>Crop</span>
-            </button>
-            <button
-                class="mode-tab"
-                class:active={activeMode === "markup"}
-                on:click={() => (activeMode = "markup")}
-            >
-                <span class="mode-icon">✎</span>
-                <span>Markup</span>
-            </button>
-        </nav>
-
-        <!-- Controls panel -->
-        <div class="controls-panel">
-            {#if activeMode === "adjust"}
-                <div class="adjustment-list no-scrollbar">
-                    {#each adjustmentSliders as slider}
-                        <div class="adj-row">
-                            <div class="adj-info">
-                                <span class="adj-icon">{slider.icon}</span>
-                                <span class="adj-label">{slider.label}</span>
-                            </div>
-                            <div class="adj-control">
-                                <input
-                                    type="range"
-                                    min={slider.min}
-                                    max={slider.max}
-                                    value={adjustments[slider.key]}
-                                    on:input={(e) =>
-                                        onSliderChange(
-                                            slider.key,
-                                            parseInt(e.currentTarget.value),
-                                        )}
-                                    class="adj-slider"
-                                />
-                                <span class="adj-value"
-                                    >{adjustments[slider.key]}</span
-                                >
-                            </div>
-                        </div>
-                    {/each}
-                </div>
-            {:else if activeMode === "filters"}
-                <div class="filter-grid no-scrollbar">
-                    {#each filterPresets as filter}
-                        <button
-                            class="filter-card"
-                            class:active={activeFilter === filter.id}
-                            on:click={() => applyFilter(filter)}
-                        >
-                            <div class="filter-preview">
-                                <span class="filter-icon">◈</span>
-                            </div>
-                            <span class="filter-name">{filter.name}</span>
-                        </button>
-                    {/each}
-                </div>
-            {:else if activeMode === "crop"}
-                <div class="crop-controls">
-                    <div class="crop-section">
-                        <h4 class="crop-title">Aspect Ratio</h4>
-                        <div class="ratio-grid">
-                            {#each aspectRatios as ratio}
-                                <button
-                                    class="ratio-btn"
-                                    class:active={cropState.aspectRatio ===
-                                        ratio.value}
-                                    on:click={() => setAspectRatio(ratio.value)}
-                                >
-                                    {ratio.label}
-                                </button>
-                            {/each}
-                        </div>
-                    </div>
-
-                    <div class="crop-section">
-                        <h4 class="crop-title">Straighten</h4>
-                        <input
-                            type="range"
-                            min="-45"
-                            max="45"
-                            value={cropState.rotation}
-                            on:input={(e) => {
-                                pushUndo();
-                                cropState = {
-                                    ...cropState,
-                                    rotation: parseInt(e.currentTarget.value),
-                                };
-                                renderPreview();
-                            }}
-                            class="straighten-slider"
-                        />
-                        <span class="straighten-value"
-                            >{cropState.rotation}°</span
-                        >
-                    </div>
-
-                    <div class="crop-actions">
-                        <button class="crop-action-btn" on:click={rotate90}>
-                            <svg
-                                width="18"
-                                height="18"
-                                viewBox="0 0 24 24"
-                                fill="none"
-                                stroke="currentColor"
-                                stroke-width="2"
-                            >
-                                <polyline points="1 4 1 10 7 10"></polyline>
-                                <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"
-                                ></path>
-                            </svg>
-                            Rotate 90°
-                        </button>
-                        <button
-                            class="crop-action-btn"
-                            on:click={flipHorizontal}
-                        >
-                            ⇔ Flip H
-                        </button>
-                        <button class="crop-action-btn" on:click={flipVertical}>
-                            ⇕ Flip V
-                        </button>
-                    </div>
-                </div>
-            {:else if activeMode === "markup"}
-                <div class="markup-controls">
-                    <div class="markup-section">
-                        <h4 class="markup-title">Tool</h4>
-                        <div class="tool-group">
-                            <button
-                                class="tool-btn"
-                                class:active={drawTool === "pen"}
-                                on:click={() => (drawTool = "pen")}>Pen</button
-                            >
-                            <button
-                                class="tool-btn"
-                                class:active={drawTool === "highlighter"}
-                                on:click={() => (drawTool = "highlighter")}
-                                >Highlight</button
-                            >
-                            <button
-                                class="tool-btn"
-                                class:active={drawTool === "pencil"}
-                                on:click={() => (drawTool = "pencil")}
-                                >Pencil</button
-                            >
-                        </div>
-                    </div>
-
-                    <div class="markup-section">
-                        <h4 class="markup-title">Color</h4>
-                        <div class="color-palette">
-                            {#each drawColors as color}
-                                <button
-                                    class="color-dot"
-                                    class:active={drawColor === color}
-                                    style="background: {color}; {color ===
-                                    '#ffffff'
-                                        ? 'border: 1px solid rgba(255,255,255,0.3);'
-                                        : ''}"
-                                    on:click={() => (drawColor = color)}
-                                ></button>
-                            {/each}
-                        </div>
-                    </div>
-
-                    <div class="markup-section">
-                        <h4 class="markup-title">Size</h4>
-                        <input
-                            type="range"
-                            min="1"
-                            max="20"
-                            bind:value={drawSize}
-                            class="size-slider"
-                        />
-                    </div>
+    <!-- Main content: Canvas + Sidebar -->
+    <div class="editor-body">
+        <!-- Canvas area -->
+        <div class="editor-canvas-area">
+            {#if !imageLoaded}
+                <div class="editor-loading">
+                    <div class="loading-spinner"></div>
+                    <span>Loading image…</span>
                 </div>
             {/if}
+            <div class="canvas-wrapper">
+                <canvas
+                    bind:this={canvasEl}
+                    class="editor-canvas"
+                ></canvas>
+            </div>
         </div>
+
+        <!-- Editing Sidebar -->
+        <EditingSidebar
+            {adjustments}
+            {histogramData}
+            {showOriginal}
+            on:change={onAdjustmentChange}
+            on:resetAll={onResetAll}
+            on:beforeAfter={onBeforeAfter}
+        />
     </div>
 </div>
 
 <style>
+    @import url('https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
+
     .editor-overlay {
         position: fixed;
         inset: 0;
         z-index: 600;
         display: flex;
         flex-direction: column;
-        background: #0a0a0a;
-        animation: fadeIn var(--duration-fast) var(--ease-out);
+        background: var(--md-sys-color-surface, #1a1a1f);
+        animation: fadeIn 250ms cubic-bezier(0.2, 0, 0, 1);
+    }
+
+    @keyframes fadeIn {
+        from { opacity: 0; }
+        to { opacity: 1; }
     }
 
     /* ── Header ── */
@@ -558,40 +288,45 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding: var(--sp-2) var(--sp-4);
-        height: 48px;
+        padding: 8px 16px;
+        height: 52px;
         flex-shrink: 0;
         border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        background: var(--md-sys-color-surface-container, #22222a);
     }
 
     .editor-title {
-        font-size: var(--text-sm);
+        font-family: 'Instrument Sans', sans-serif;
+        font-size: 15px;
         font-weight: 600;
-        color: rgba(255, 255, 255, 0.85);
+        color: var(--md-sys-color-on-surface, rgba(255, 255, 255, 0.85));
     }
 
     .editor-actions {
         display: flex;
         align-items: center;
-        gap: var(--sp-2);
+        gap: 8px;
     }
 
     .editor-btn {
+        display: flex;
+        align-items: center;
+        gap: 4px;
         padding: 6px 14px;
-        border-radius: var(--radius-md);
-        font-size: var(--text-sm);
+        border-radius: 12px;
+        font-family: 'Instrument Sans', sans-serif;
+        font-size: 13px;
         font-weight: 500;
-        color: rgba(255, 255, 255, 0.7);
-        transition: var(--transition-fast);
-    }
-
-    .editor-btn :global(svg) {
-        display: block;
+        color: var(--md-sys-color-on-surface-variant, rgba(255, 255, 255, 0.65));
+        background: var(--md-sys-color-surface-container-high, rgba(255,255,255,0.06));
+        border: none;
+        cursor: pointer;
+        transition: all 150ms cubic-bezier(0.2, 0, 0, 1);
     }
 
     .editor-btn:hover {
-        background: rgba(255, 255, 255, 0.1);
-        color: white;
+        background: rgba(255, 255, 255, 0.12);
+        color: rgba(255, 255, 255, 0.9);
     }
 
     .editor-btn:disabled {
@@ -601,23 +336,41 @@
 
     .editor-btn.cancel {
         color: rgba(255, 255, 255, 0.5);
+        background: transparent;
+    }
+
+    .editor-btn.cancel:hover {
+        color: rgba(255, 255, 255, 0.8);
+        background: rgba(255, 255, 255, 0.06);
+    }
+
+    .btn-icon {
+        font-size: 14px;
     }
 
     .editor-btn.save {
-        background: var(--accent);
-        color: white;
+        background: var(--md-sys-color-primary, #a0c4ff);
+        color: var(--md-sys-color-on-primary, #003258);
         font-weight: 600;
     }
 
     .editor-btn.save:hover {
-        background: var(--accent-hover);
+        filter: brightness(1.1);
+        transform: scale(1.02);
     }
 
     .editor-btn.save:disabled {
         opacity: 0.5;
+        transform: none;
     }
 
-    /* ── Canvas Area ── */
+    /* ── Body: Canvas + Sidebar ── */
+    .editor-body {
+        flex: 1;
+        display: flex;
+        min-height: 0;
+    }
+
     .editor-canvas-area {
         flex: 1;
         display: flex;
@@ -625,380 +378,52 @@
         justify-content: center;
         overflow: hidden;
         position: relative;
-        padding: var(--sp-3);
+        background: #0e0e12;
+        padding: 16px;
+    }
+
+    .canvas-wrapper {
+        will-change: transform;
+        contain: strict;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        max-width: 100%;
+        max-height: 100%;
     }
 
     .editor-canvas {
         max-width: 100%;
         max-height: 100%;
         object-fit: contain;
-        border-radius: var(--radius-sm);
-    }
-
-    .editor-canvas.drawing {
-        cursor: crosshair;
+        border-radius: 4px;
+        box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
     }
 
     .editor-loading {
+        position: absolute;
+        inset: 0;
         display: flex;
         flex-direction: column;
         align-items: center;
-        gap: var(--sp-2);
+        justify-content: center;
+        gap: 12px;
         color: rgba(255, 255, 255, 0.5);
-        font-size: var(--text-sm);
+        font-family: 'Instrument Sans', sans-serif;
+        font-size: 14px;
+        z-index: 2;
     }
 
     .loading-spinner {
-        width: 24px;
-        height: 24px;
+        width: 28px;
+        height: 28px;
         border-radius: 50%;
-        border: 2px solid rgba(255, 255, 255, 0.08);
-        border-top-color: rgba(255, 255, 255, 0.5);
+        border: 3px solid rgba(255, 255, 255, 0.08);
+        border-top-color: var(--md-sys-color-primary, #a0c4ff);
         animation: spin 0.7s linear infinite;
     }
 
-    /* ── Bottom Panel ── */
-    .editor-bottom {
-        flex-shrink: 0;
-        border-top: 1px solid rgba(255, 255, 255, 0.06);
-        background: rgba(15, 15, 15, 0.95);
-        backdrop-filter: blur(20px);
-    }
-
-    .mode-tabs {
-        display: flex;
-        justify-content: center;
-        gap: 2px;
-        padding: var(--sp-2) var(--sp-4);
-        border-bottom: 1px solid rgba(255, 255, 255, 0.04);
-    }
-
-    .mode-tab {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: 2px;
-        padding: 6px 20px;
-        border-radius: var(--radius-md);
-        color: rgba(255, 255, 255, 0.4);
-        font-size: 11px;
-        font-weight: 500;
-        transition: var(--transition-fast);
-    }
-
-    .mode-tab:hover {
-        color: rgba(255, 255, 255, 0.6);
-    }
-
-    .mode-tab.active {
-        color: var(--accent);
-        background: var(--accent-subtle);
-    }
-
-    .mode-icon {
-        font-size: 16px;
-        line-height: 1;
-    }
-
-    /* ── Controls Panel ── */
-    .controls-panel {
-        padding: var(--sp-3) var(--sp-4);
-        max-height: 200px;
-        overflow-y: auto;
-    }
-
-    /* Adjustments */
-    .adjustment-list {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
-    }
-
-    .adj-row {
-        display: flex;
-        align-items: center;
-        gap: var(--sp-3);
-        padding: 4px var(--sp-2);
-        border-radius: var(--radius-sm);
-    }
-
-    .adj-row:hover {
-        background: rgba(255, 255, 255, 0.03);
-    }
-
-    .adj-info {
-        display: flex;
-        align-items: center;
-        gap: var(--sp-2);
-        width: 120px;
-        flex-shrink: 0;
-    }
-
-    .adj-icon {
-        font-size: 14px;
-        width: 20px;
-        text-align: center;
-        color: rgba(255, 255, 255, 0.4);
-    }
-
-    .adj-label {
-        font-size: var(--text-xs);
-        color: rgba(255, 255, 255, 0.65);
-        font-weight: 450;
-    }
-
-    .adj-control {
-        flex: 1;
-        display: flex;
-        align-items: center;
-        gap: var(--sp-2);
-    }
-
-    .adj-slider {
-        -webkit-appearance: none;
-        appearance: none;
-        flex: 1;
-        height: 3px;
-        background: rgba(255, 255, 255, 0.12);
-        border-radius: var(--radius-full);
-        outline: none;
-    }
-
-    .adj-slider::-webkit-slider-thumb {
-        -webkit-appearance: none;
-        appearance: none;
-        width: 14px;
-        height: 14px;
-        border-radius: 50%;
-        background: white;
-        cursor: pointer;
-        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
-    }
-
-    .adj-value {
-        font-size: 11px;
-        color: rgba(255, 255, 255, 0.4);
-        font-weight: 500;
-        width: 30px;
-        text-align: right;
-        font-variant-numeric: tabular-nums;
-    }
-
-    /* Filters */
-    .filter-grid {
-        display: flex;
-        gap: var(--sp-2);
-        overflow-x: auto;
-        padding: var(--sp-1) 0;
-    }
-
-    .filter-card {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: 4px;
-        flex-shrink: 0;
-        transition: var(--transition-fast);
-    }
-
-    .filter-preview {
-        width: 64px;
-        height: 64px;
-        border-radius: var(--radius-md);
-        background: rgba(255, 255, 255, 0.06);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        border: 2px solid transparent;
-        transition: var(--transition-fast);
-    }
-
-    .filter-card.active .filter-preview {
-        border-color: var(--accent);
-    }
-
-    .filter-icon {
-        font-size: 20px;
-        color: rgba(255, 255, 255, 0.3);
-    }
-
-    .filter-name {
-        font-size: 10px;
-        color: rgba(255, 255, 255, 0.5);
-        font-weight: 500;
-    }
-
-    .filter-card.active .filter-name {
-        color: var(--accent);
-    }
-
-    /* Crop */
-    .crop-controls {
-        display: flex;
-        flex-direction: column;
-        gap: var(--sp-4);
-    }
-
-    .crop-title,
-    .markup-title {
-        font-size: 11px;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        color: rgba(255, 255, 255, 0.3);
-        margin-bottom: var(--sp-2);
-    }
-
-    .ratio-grid {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 4px;
-    }
-
-    .ratio-btn {
-        padding: 5px 12px;
-        border-radius: var(--radius-sm);
-        font-size: var(--text-xs);
-        font-weight: 500;
-        color: rgba(255, 255, 255, 0.5);
-        background: rgba(255, 255, 255, 0.05);
-        border: 1px solid transparent;
-        transition: var(--transition-fast);
-    }
-
-    .ratio-btn:hover {
-        background: rgba(255, 255, 255, 0.08);
-    }
-
-    .ratio-btn.active {
-        border-color: var(--accent);
-        color: var(--accent);
-        background: var(--accent-subtle);
-    }
-
-    .straighten-slider {
-        -webkit-appearance: none;
-        appearance: none;
-        width: 200px;
-        height: 3px;
-        background: rgba(255, 255, 255, 0.12);
-        border-radius: var(--radius-full);
-        outline: none;
-    }
-
-    .straighten-slider::-webkit-slider-thumb {
-        -webkit-appearance: none;
-        appearance: none;
-        width: 14px;
-        height: 14px;
-        border-radius: 50%;
-        background: white;
-        cursor: pointer;
-    }
-
-    .straighten-value {
-        font-size: 11px;
-        color: rgba(255, 255, 255, 0.4);
-        font-weight: 500;
-        margin-left: var(--sp-2);
-    }
-
-    .crop-actions {
-        display: flex;
-        gap: var(--sp-2);
-    }
-
-    .crop-action-btn {
-        display: flex;
-        align-items: center;
-        gap: 4px;
-        padding: 6px 12px;
-        border-radius: var(--radius-md);
-        font-size: var(--text-xs);
-        font-weight: 500;
-        color: rgba(255, 255, 255, 0.6);
-        background: rgba(255, 255, 255, 0.06);
-        transition: var(--transition-fast);
-    }
-
-    .crop-action-btn :global(svg) {
-        width: 14px;
-        height: 14px;
-    }
-
-    .crop-action-btn:hover {
-        background: rgba(255, 255, 255, 0.1);
-        color: white;
-    }
-
-    /* Markup */
-    .markup-controls {
-        display: flex;
-        gap: var(--sp-6);
-        align-items: flex-start;
-    }
-
-    .tool-group {
-        display: flex;
-        gap: 2px;
-        background: rgba(255, 255, 255, 0.04);
-        border-radius: var(--radius-md);
-        padding: 2px;
-    }
-
-    .tool-btn {
-        padding: 5px 12px;
-        border-radius: var(--radius-sm);
-        font-size: var(--text-xs);
-        font-weight: 500;
-        color: rgba(255, 255, 255, 0.5);
-        transition: var(--transition-fast);
-    }
-
-    .tool-btn.active {
-        background: var(--accent);
-        color: white;
-    }
-
-    .color-palette {
-        display: flex;
-        gap: 4px;
-    }
-
-    .color-dot {
-        width: 22px;
-        height: 22px;
-        border-radius: 50%;
-        cursor: pointer;
-        transition: transform var(--duration-fast) var(--ease-spring);
-    }
-
-    .color-dot:hover {
-        transform: scale(1.15);
-    }
-
-    .color-dot.active {
-        transform: scale(1.2);
-        box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.3);
-    }
-
-    .size-slider {
-        -webkit-appearance: none;
-        appearance: none;
-        width: 100px;
-        height: 3px;
-        background: rgba(255, 255, 255, 0.12);
-        border-radius: var(--radius-full);
-        outline: none;
-    }
-
-    .size-slider::-webkit-slider-thumb {
-        -webkit-appearance: none;
-        appearance: none;
-        width: 14px;
-        height: 14px;
-        border-radius: 50%;
-        background: white;
-        cursor: pointer;
+    @keyframes spin {
+        to { transform: rotate(360deg); }
     }
 </style>
