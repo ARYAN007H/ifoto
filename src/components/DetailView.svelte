@@ -22,6 +22,7 @@
     import { showEditor } from "../lib/store";
 
     let imageSrc = "";
+    let bgSrc = ""; // Thumbnail used for blurred background (lighter than full-res)
     let imageLoading = true;
     let filmstripEl: HTMLDivElement;
     let thumbnailCache = new Map<string, string>();
@@ -87,8 +88,13 @@
         try {
             // Load the full resolution image directly using its absolute path
             imageSrc = convertFileSource(photo.path);
+            // Load a lightweight thumbnail for the blurred background
+            // (blurred to 80px means a 320px thumb is visually identical)
+            const thumbPath = await getThumbnail(photo.path);
+            bgSrc = thumbPath ? convertFileSource(thumbPath) : imageSrc;
         } catch (err) {
             console.error("Failed to load image:", err);
+            bgSrc = imageSrc; // Fallback to full-res if thumb fails
         }
         imageLoading = false;
     }
@@ -288,10 +294,10 @@
     on:touchstart={handleTouchStart}
     on:touchend={handleTouchEnd}
 >
-    <!-- Background blur -->
+    <!-- Background blur (uses thumbnail to save memory) -->
     <div class="lightbox-bg">
-        {#if imageSrc}
-            <img src={imageSrc} alt="" class="bg-blur" draggable="false" />
+        {#if bgSrc}
+            <img src={bgSrc} alt="" class="bg-blur" draggable="false" />
         {/if}
     </div>
 

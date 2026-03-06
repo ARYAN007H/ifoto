@@ -3,7 +3,7 @@
 </script>
 
 <script lang="ts">
-    import { onMount, onDestroy } from "svelte";
+    import { onMount, onDestroy, tick } from "svelte";
     import {
         groupedPhotos,
         filteredPhotos,
@@ -16,9 +16,10 @@
         loadMorePhotos,
         hasMorePhotos,
         isLoadingMore,
+        getThumbnail,
+        convertFileSource,
     } from "../lib/store";
     import type { Photo } from "../lib/store";
-    import { getPhotoSrc } from "../lib/store";
 
     $: columnCount = getColumnCount($appSettings.gridZoom);
 
@@ -58,9 +59,15 @@
         }
     }
 
-    /** Direct file source — instant, no IPC thumbnail generation */
-    function getPhotoUrl(photo: Photo): string {
-        return getPhotoSrc(photo);
+    /** Load a thumbnail for a photo — uses backend 320px JPEG cache.
+     *  Falls back to direct asset protocol if thumbnail fails. */
+    async function getPhotoUrl(photo: Photo): Promise<string> {
+        try {
+            const thumbPath = await getThumbnail(photo.path);
+            if (thumbPath) return convertFileSource(thumbPath);
+        } catch {}
+        // Fallback: serve original via asset protocol
+        return convertFileSource(photo.path);
     }
 
     function openPhoto(photo: Photo) {
@@ -91,55 +98,60 @@
         }
     }
 
-    // ── Viewport-Aware Lazy Loading ──
-    // Only set img src when the card is near the viewport, clear when far away.
-    // This prevents hundreds of full-res images from being decoded in GPU memory.
+    // ── Viewport-Aware Lazy Loading (Single Shared Observer) ──
+    // One IntersectionObserver manages ALL cards, instead of one per card.
+    // Loads thumbnails (320px JPEG) when near viewport, unloads when far away.
 
-    const lazyObservers = new Map<HTMLElement, IntersectionObserver>();
+    const cardPhotoMap = new Map<Element, Photo>();
+    let lazyObserver: IntersectionObserver;
 
-    function lazyLoad(node: HTMLElement, photo: Photo) {
-        const img = node.querySelector("img.lazy-photo") as HTMLImageElement;
-        if (!img) return;
-
-        const observer = new IntersectionObserver(
+    function createLazyObserver() {
+        return new IntersectionObserver(
             (entries) => {
                 for (const entry of entries) {
+                    const card = entry.target as HTMLElement;
+                    const img = card.querySelector("img.lazy-photo") as HTMLImageElement;
+                    if (!img) continue;
+
                     if (entry.isIntersecting) {
-                        // Load: set src when within view buffer
                         if (!img.src || img.src === "") {
-                            img.src = getPhotoUrl(photo);
+                            const photo = cardPhotoMap.get(card);
+                            if (photo) {
+                                getPhotoUrl(photo).then((url) => {
+                                    // Only set if still observed (not destroyed)
+                                    if (cardPhotoMap.has(card)) {
+                                        img.src = url;
+                                    }
+                                });
+                            }
                         }
                     } else {
-                        // Unload: clear src when far from viewport to free GPU memory
-                        // Only clear if it's very far away (5x viewport)
+                        // Unload when very far from viewport to free memory
                         const rect = entry.boundingClientRect;
-                        const viewportHeight =
-                            entry.rootBounds?.height || window.innerHeight;
-                        const distance = Math.max(
-                            rect.top -
-                                (entry.rootBounds?.bottom ||
-                                    window.innerHeight),
+                        const vh = entry.rootBounds?.height || window.innerHeight;
+                        const dist = Math.max(
+                            rect.top - (entry.rootBounds?.bottom || vh),
                             (entry.rootBounds?.top || 0) - rect.bottom,
                         );
-                        if (distance > viewportHeight * 4 && img.src) {
+                        if (dist > vh * 4 && img.src) {
                             img.removeAttribute("src");
+                            card.classList.remove("img-loaded");
                         }
                     }
                 }
             },
-            {
-                // Load when within 2 viewport heights
-                rootMargin: "200% 0px 200% 0px",
-            },
+            { rootMargin: "150% 0px 150% 0px" },
         );
+    }
 
-        observer.observe(node);
-        lazyObservers.set(node, observer);
+    function lazyLoad(node: HTMLElement, photo: Photo) {
+        cardPhotoMap.set(node, photo);
+        if (lazyObserver) lazyObserver.observe(node);
 
         return {
             destroy() {
-                observer.disconnect();
-                lazyObservers.delete(node);
+                cardPhotoMap.delete(node);
+                if (lazyObserver) lazyObserver.unobserve(node);
             },
         };
     }
@@ -149,6 +161,11 @@
     let observer: IntersectionObserver;
 
     onMount(() => {
+        // Create the single shared lazy-load observer
+        lazyObserver = createLazyObserver();
+        // Re-observe any cards already in the DOM
+        cardPhotoMap.forEach((_, node) => lazyObserver.observe(node as Element));
+
         observer = new IntersectionObserver(
             (entries) => {
                 if (
@@ -166,9 +183,8 @@
 
     onDestroy(() => {
         observer?.disconnect();
-        // Clean up all lazy observers
-        lazyObservers.forEach((obs) => obs.disconnect());
-        lazyObservers.clear();
+        lazyObserver?.disconnect();
+        cardPhotoMap.clear();
     });
 
     // Re-observe whenever the sentinel element is recreated by Svelte
@@ -226,8 +242,10 @@
 
     function handleImgLoad(e: Event) {
         const target = e.currentTarget as HTMLImageElement | null;
-        if (target && target.nextElementSibling) {
-            (target.nextElementSibling as HTMLElement).style.display = "none";
+        if (target) {
+            // Mark card as loaded to stop shimmer and hide placeholder
+            const card = target.closest(".photo-card");
+            if (card) card.classList.add("img-loaded");
         }
     }
 </script>
@@ -428,7 +446,7 @@
             transform var(--duration-fast) var(--ease-emphasized),
             box-shadow var(--duration-fast) var(--ease-standard),
             border-radius var(--duration-fast) var(--ease-standard);
-        will-change: transform;
+        /* Removed will-change: transform — promoting hundreds of layers kills GPU memory */
     }
 
     .photo-card:hover {
@@ -478,6 +496,14 @@
         );
         background-size: 200% 100%;
         animation: shimmer 1.5s linear infinite;
+        transition: opacity var(--duration-base) var(--ease-standard);
+    }
+
+    /* Fade out and stop placeholder once image has loaded */
+    .photo-card.img-loaded .placeholder {
+        opacity: 0;
+        pointer-events: none;
+        animation: none; /* Stop shimmer to free up compositor */
     }
 
     .placeholder-icon {
@@ -659,20 +685,19 @@
         grid-row: span 2;
     }
 
-    /* Entrance animation */
-    .layout-expressive .photo-card {
-        animation: expressiveIn 0.4s var(--ease-emphasized-decel) both;
+    /* Expressive entrance: fade-in on load instead of on DOM mount.
+       The .img-loaded class is added when the thumbnail finishes loading,
+       so animations are naturally staggered and never storm on mount. */
+    .layout-expressive .photo-card .lazy-photo {
+        opacity: 0;
+        transform: scale(0.97);
     }
 
-    @keyframes expressiveIn {
-        from {
-            opacity: 0;
-            transform: scale(0.96);
-        }
-        to {
-            opacity: 1;
-            transform: scale(1);
-        }
+    .layout-expressive .photo-card.img-loaded .lazy-photo {
+        opacity: 1;
+        transform: scale(1);
+        transition: opacity 0.35s var(--ease-emphasized-decel),
+                    transform 0.35s var(--ease-emphasized-decel);
     }
 
     /* ── No Results ── */

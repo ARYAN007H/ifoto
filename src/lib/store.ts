@@ -236,6 +236,18 @@ export const filters = writable<FilterState>({
 
 // ── Derived Stores ──
 
+// Cache timestamps so sort comparisons don't create Date objects every time.
+// WeakMap ensures entries are GC'd when photos leave the store.
+const timestampCache = new WeakMap<Photo, number>()
+function getTimestamp(photo: Photo): number {
+    let ts = timestampCache.get(photo)
+    if (ts === undefined) {
+        ts = new Date(photo.takenAt || photo.modifiedAt).getTime()
+        timestampCache.set(photo, ts)
+    }
+    return ts
+}
+
 export const filteredPhotos = derived(
     [photos, filters, searchQuery, sortBy, activeSection, activeSource],
     ([$photos, $filters, $searchQuery, $sortBy, $activeSection, $activeSource]) => {
@@ -253,12 +265,8 @@ export const filteredPhotos = derived(
             filtered = filtered.filter(p => p.mediaType === 'video')
         } else if ($activeSection === 'recents') {
             // Last 30 days
-            const cutoff = new Date()
-            cutoff.setDate(cutoff.getDate() - 30)
-            filtered = filtered.filter(p => {
-                const date = new Date(p.takenAt || p.modifiedAt)
-                return date >= cutoff
-            })
+            const cutoff = Date.now() - 30 * 86400000
+            filtered = filtered.filter(p => getTimestamp(p) >= cutoff)
         }
 
         // Search filter
@@ -284,7 +292,7 @@ export const filteredPhotos = derived(
         // Year filter
         if ($filters.selectedYear) {
             filtered = filtered.filter(p => {
-                const year = p.takenAt ? new Date(p.takenAt).getFullYear() : new Date(p.modifiedAt).getFullYear()
+                const year = new Date(getTimestamp(p)).getFullYear()
                 return year === $filters.selectedYear
             })
         }
@@ -292,18 +300,18 @@ export const filteredPhotos = derived(
         // Month filter
         if ($filters.selectedMonth !== null && $filters.selectedYear) {
             filtered = filtered.filter(p => {
-                const date = new Date(p.takenAt || p.modifiedAt)
+                const date = new Date(getTimestamp(p))
                 return date.getFullYear() === $filters.selectedYear && date.getMonth() === $filters.selectedMonth
             })
         }
 
-        // Sort
+        // Sort — uses cached timestamps instead of creating Date objects per comparison
         filtered = [...filtered].sort((a, b) => {
             switch ($sortBy) {
                 case 'date-desc':
-                    return new Date(b.takenAt || b.modifiedAt).getTime() - new Date(a.takenAt || a.modifiedAt).getTime()
+                    return getTimestamp(b) - getTimestamp(a)
                 case 'date-asc':
-                    return new Date(a.takenAt || a.modifiedAt).getTime() - new Date(b.takenAt || b.modifiedAt).getTime()
+                    return getTimestamp(a) - getTimestamp(b)
                 case 'name-asc':
                     return a.filename.localeCompare(b.filename)
                 case 'name-desc':
@@ -332,9 +340,13 @@ export const groupedPhotos = derived(filteredPhotos, ($filtered) => {
 
     const groupMap = new Map<string, Photo[]>()
     const groupLabels = new Map<string, string>()
+    const monthNames = ['January', 'February', 'March', 'April', 'May', 'June',
+        'July', 'August', 'September', 'October', 'November', 'December']
 
     for (const photo of $filtered) {
-        const date = new Date(photo.takenAt || photo.modifiedAt)
+        // Use cached timestamp to avoid creating Date objects repeatedly
+        const ts = getTimestamp(photo)
+        const date = new Date(ts)
         const photoDay = new Date(date.getFullYear(), date.getMonth(), date.getDate())
 
         let label: string
@@ -353,8 +365,6 @@ export const groupedPhotos = derived(filteredPhotos, ($filtered) => {
             label = 'This Month'
             dateKey = 'this-month'
         } else {
-            const monthNames = ['January', 'February', 'March', 'April', 'May', 'June',
-                'July', 'August', 'September', 'October', 'November', 'December']
             label = `${monthNames[date.getMonth()]} ${date.getFullYear()}`
             dateKey = `${date.getFullYear()}-${String(date.getMonth()).padStart(2, '0')}`
         }
