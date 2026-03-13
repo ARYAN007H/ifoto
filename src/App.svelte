@@ -22,6 +22,9 @@
     import BatchActionBar from "./components/BatchActionBar.svelte";
     import PhotoEditor from "./components/PhotoEditor.svelte";
     import AlbumView from "./components/AlbumView.svelte";
+    import FullBleedPreview from "./components/FullBleedPreview.svelte";
+    import { longPressPhoto } from "./components/PhotoGrid.svelte";
+    import { ambientColor } from "./lib/ambientColor";
     import { photos, libraryPath } from "./lib/store";
 
     $: isDarkMode = $appSettings.theme === "dark";
@@ -77,7 +80,11 @@
 
 <svelte:window on:keydown={handleKeydown} />
 
-<div class="app-shell" class:dark={isDarkMode}>
+<div
+    class="app-shell"
+    class:dark={isDarkMode}
+    style="--ambient-r: {$ambientColor.r}; --ambient-g: {$ambientColor.g}; --ambient-b: {$ambientColor.b};"
+>
     <Toolbar />
 
     <div class="app-body">
@@ -128,6 +135,11 @@
     {/if}
 
     <BatchActionBar />
+
+    <!-- Long-press full-bleed preview -->
+    {#if $longPressPhoto}
+        <FullBleedPreview photo={$longPressPhoto} visible={true} />
+    {/if}
 </div>
 
 <style>
@@ -176,12 +188,13 @@
             box-shadow var(--duration-base) var(--ease-standard);
     }
 
-    /* Expressive mode: edge-to-edge immersive */
+    /* Expressive mode: edge-to-edge immersive with ambient color */
     .app-main.expressive-main {
         border: none;
         border-radius: var(--radius-lg);
         box-shadow: none;
-        background: var(--bg-app);
+        background: rgb(var(--ambient-r, 18), var(--ambient-g, 18), var(--ambient-b, 30));
+        transition: background 800ms ease;
     }
 
     /* ── M3 Indexing State ── */

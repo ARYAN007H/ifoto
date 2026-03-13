@@ -4,8 +4,11 @@
         selectedPhoto,
         convertFileSource,
         invokeCommand,
+        filteredPhotos,
     } from "../lib/store";
+    import type { Photo } from "../lib/store";
     import EditingSidebar from "../lib/editing/EditingSidebar.svelte";
+    import Histogram from "../lib/editing/Histogram.svelte";
     import {
         type AdjustmentState,
         defaultAdjustments,
@@ -23,10 +26,11 @@
         renderStrokes,
         canvasToBase64,
     } from "../lib/imageProcessing";
+    import { getCachedThumb } from "../lib/thumbnailCache";
 
     export let onClose: () => void;
 
-    // State
+    // ── State ──
     let adjustments: AdjustmentState = cloneAdjustments(defaultAdjustments);
     let histogramData: HistogramData | null = null;
     let showOriginal = false;
@@ -42,8 +46,6 @@
     let imageLoaded = false;
     let imgW = 0;
     let imgH = 0;
-
-    // Original image data for before/after
     let originalImageData: ImageData | null = null;
 
     // Undo
@@ -65,22 +67,28 @@
     let panStartPanX = 0;
     let panStartPanY = 0;
 
-    function zoomIn() {
-        zoomLevel = Math.min(zoomLevel * 1.25, 8);
-    }
-    function zoomOut() {
-        zoomLevel = Math.max(zoomLevel / 1.25, 0.25);
-    }
-    function zoomFit() {
-        zoomLevel = 1;
-        panX = 0;
-        panY = 0;
-    }
+    // Tool strip
+    type EditorTool = 'adjust' | 'crop';
+    let activeTool: EditorTool = 'adjust';
+
+    // Panel visibility
+    let showPanel = true;
+    let showHistogramOverlay = true;
+
+    // Before/After split
+    let splitPosition = 50; // percent
+    let isDraggingSplit = false;
+
+    // Filmstrip
+    $: filmstripPhotos = $filteredPhotos.slice(0, 100); // first 100 for filmstrip
+    $: currentPhotoIndex = filmstripPhotos.findIndex(p => p.id === $selectedPhoto?.id);
+    let filmstripEl: HTMLDivElement;
+
+    // ── Zoom Functions ──
+    function zoomIn() { zoomLevel = Math.min(zoomLevel * 1.25, 8); }
+    function zoomOut() { zoomLevel = Math.max(zoomLevel / 1.25, 0.25); }
+    function zoomFit() { zoomLevel = 1; panX = 0; panY = 0; }
     function zoom100() {
-        zoomLevel = 1;
-        panX = 0;
-        panY = 0;
-        // Calculate 100% zoom relative to fit
         if (canvasEl) {
             const area = canvasEl.parentElement?.parentElement;
             if (area) {
@@ -90,6 +98,7 @@
                 zoomLevel = 1 / fitScale;
             }
         }
+        panX = 0; panY = 0;
     }
 
     function handleWheel(e: WheelEvent) {
@@ -118,64 +127,48 @@
         isPanning = false;
     }
 
+    // ── Sidebar Resize ──
     function startResize(e: MouseEvent) {
         e.preventDefault();
         isResizing = true;
         const startX = e.clientX;
         const startWidth = sidebarWidth;
-
         function onMove(ev: MouseEvent) {
-            const delta = startX - ev.clientX;
-            sidebarWidth = Math.max(MIN_SIDEBAR, Math.min(MAX_SIDEBAR, startWidth + delta));
+            sidebarWidth = Math.max(MIN_SIDEBAR, Math.min(MAX_SIDEBAR, startWidth + (startX - ev.clientX)));
         }
-
         function onUp() {
             isResizing = false;
             window.removeEventListener('mousemove', onMove);
             window.removeEventListener('mouseup', onUp);
         }
-
         window.addEventListener('mousemove', onMove);
         window.addEventListener('mouseup', onUp);
     }
 
+    // ── Image Loading ──
     onMount(async () => {
         if (!$selectedPhoto) return;
-
         imagePath = $selectedPhoto.path;
         sourceImg = new Image();
         sourceImg.crossOrigin = "anonymous";
         sourceImg.onload = () => {
             imgW = sourceImg.naturalWidth;
             imgH = sourceImg.naturalHeight;
-
-            // Create source canvas
             sourceCanvas = document.createElement("canvas");
             sourceCanvas.width = imgW;
             sourceCanvas.height = imgH;
             const sctx = sourceCanvas.getContext("2d")!;
             sctx.drawImage(sourceImg, 0, 0);
-
-            // Get original image data for before/after & initial histogram
             originalImageData = sctx.getImageData(0, 0, imgW, imgH);
             histogramData = computeHistogram(originalImageData);
-
-            // Setup display canvas
             initCanvas();
         };
         sourceImg.onerror = () => {
             console.error("Failed to load image for editor");
             imageLoaded = true;
         };
-
         sourceImg.src = convertFileSource($selectedPhoto.path);
-
-        setTimeout(() => {
-            if (!imageLoaded) {
-                console.warn("Editor image load timed out");
-                imageLoaded = true;
-            }
-        }, 10000);
+        setTimeout(() => { if (!imageLoaded) imageLoaded = true; }, 10000);
     });
 
     function initCanvas() {
@@ -194,9 +187,9 @@
         tryInit();
     }
 
+    // ── Processing Pipeline ──
     async function triggerProcess(preview: boolean = true) {
         if (!imagePath || !canvasEl || !ctx) return;
-
         const result = await processImage(imagePath, adjustments, preview, preview ? 80 : 0);
         if (result && ctx && canvasEl) {
             if (result.width !== canvasEl.width || result.height !== canvasEl.height) {
@@ -226,6 +219,7 @@
         }
     }
 
+    // ── Adjustment Handlers ──
     function onAdjustmentChange(e: CustomEvent<Partial<AdjustmentState>>) {
         undoStack = [...undoStack, cloneAdjustments(adjustments)];
         adjustments = { ...adjustments, ...e.detail };
@@ -268,77 +262,134 @@
             const ext = originalPath.split(".").pop() || "jpg";
             const baseName = originalPath.replace(`.${ext}`, "");
             const savePath = `${baseName}_edited.${ext}`;
-            await invokeCommand("save_edited_photo", {
-                imageData: data,
-                targetPath: savePath,
-            });
+            await invokeCommand("save_edited_photo", { imageData: data, targetPath: savePath });
             onClose();
-        } catch (err) {
-            console.error("Save failed:", err);
-        }
+        } catch (err) { console.error("Save failed:", err); }
         saving = false;
     }
 
+    // ── Filmstrip Navigation ──
+    function navigateToPhoto(photo: Photo) {
+        if (hasChanges && !confirm("Discard unsaved changes?")) return;
+        selectedPhoto.set(photo);
+        adjustments = cloneAdjustments(defaultAdjustments);
+        undoStack = [];
+        hasChanges = false;
+        imagePath = photo.path;
+        imageLoaded = false;
+        sourceImg = new Image();
+        sourceImg.crossOrigin = "anonymous";
+        sourceImg.onload = () => {
+            imgW = sourceImg.naturalWidth;
+            imgH = sourceImg.naturalHeight;
+            sourceCanvas = document.createElement("canvas");
+            sourceCanvas.width = imgW;
+            sourceCanvas.height = imgH;
+            const sctx = sourceCanvas.getContext("2d")!;
+            sctx.drawImage(sourceImg, 0, 0);
+            originalImageData = sctx.getImageData(0, 0, imgW, imgH);
+            histogramData = computeHistogram(originalImageData);
+            initCanvas();
+        };
+        sourceImg.src = convertFileSource(photo.path);
+    }
+
+    function nextPhoto() {
+        if (currentPhotoIndex < filmstripPhotos.length - 1) {
+            navigateToPhoto(filmstripPhotos[currentPhotoIndex + 1]);
+        }
+    }
+
+    function prevPhoto() {
+        if (currentPhotoIndex > 0) {
+            navigateToPhoto(filmstripPhotos[currentPhotoIndex - 1]);
+        }
+    }
+
+    // ── Keyboard Shortcuts ──
     function handleKeydown(e: KeyboardEvent) {
         if (e.key === "Escape") onClose();
         if (e.key === "z" && (e.ctrlKey || e.metaKey)) undo();
         if (e.key === "=" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); zoomIn(); }
         if (e.key === "-" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); zoomOut(); }
         if (e.key === "0" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); zoomFit(); }
+        if (e.key === "ArrowRight") nextPhoto();
+        if (e.key === "ArrowLeft") prevPhoto();
+        if (e.key === "\\") showOriginal = !showOriginal;
+        if (e.key === "h") showHistogramOverlay = !showHistogramOverlay;
+        if (e.key === "p") showPanel = !showPanel;
     }
 
     function handlePointerUp() {
-        if (hasChanges) {
-            triggerFullRes();
-        }
+        if (hasChanges) triggerFullRes();
     }
 
     $: zoomPercent = Math.round(zoomLevel * 100);
+    $: filename = $selectedPhoto?.filename || '';
 </script>
 
 <svelte:window on:keydown={handleKeydown} on:pointerup={handlePointerUp} />
 
-<div class="editor-overlay">
-    <!-- Top bar -->
-    <header class="editor-header">
-        <button class="editor-btn cancel" on:click={onClose}>
-            <span class="btn-icon">✕</span>
-            <span>Cancel</span>
-        </button>
-        <div class="editor-title">Edit Photo</div>
-        <div class="editor-actions">
-            <!-- Zoom controls -->
+<div class="editor-shell">
+    <!-- ═══ ZONE 1: Toolbar (48px top) ═══ -->
+    <header class="editor-toolbar">
+        <div class="toolbar-left">
+            <button class="tool-btn" on:click={onClose} title="Back (Esc)">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
+            </button>
+            <span class="toolbar-filename" title={filename}>{filename}</span>
+            {#if hasChanges}
+                <span class="toolbar-modified">●</span>
+            {/if}
+        </div>
+
+        <div class="toolbar-center">
+            <button class="tool-btn" class:active={showOriginal}
+                on:mousedown={() => { showOriginal = true; if (originalImageData && ctx) ctx.putImageData(originalImageData, 0, 0); }}
+                on:mouseup={() => { showOriginal = false; triggerProcess(true); }}
+                title="Hold for before (\\)"
+            >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M11 2v20a10 10 0 0 1 0-20zm2 0v20a10 10 0 0 0 0-20z"/></svg>
+                <span>B/A</span>
+            </button>
+        </div>
+
+        <div class="toolbar-right">
             <div class="zoom-controls">
-                <button class="zoom-btn" on:click={zoomOut} title="Zoom out (Ctrl+-)">−</button>
-                <button class="zoom-label" on:click={zoomFit} title="Fit to view (Ctrl+0)">{zoomPercent}%</button>
-                <button class="zoom-btn" on:click={zoomIn} title="Zoom in (Ctrl+=)">+</button>
+                <button class="zoom-btn" on:click={zoomOut} title="Zoom out">−</button>
+                <button class="zoom-label" on:click={zoomFit} title="Fit (Ctrl+0)">{zoomPercent}%</button>
+                <button class="zoom-btn" on:click={zoomIn} title="Zoom in">+</button>
                 <button class="zoom-btn text" on:click={zoom100} title="100%">1:1</button>
             </div>
-            <div class="header-divider"></div>
-            <button
-                class="editor-btn"
-                on:click={undo}
-                disabled={undoStack.length === 0}
-                title="Undo (Ctrl+Z)"
-            >
-                ↩ Undo
+            <div class="toolbar-sep"></div>
+            <button class="tool-btn" on:click={undo} disabled={undoStack.length === 0} title="Undo (Ctrl+Z)">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12.5 8c-2.65 0-5.05.99-6.9 2.6L2 7v9h9l-3.62-3.62c1.39-1.16 3.16-1.88 5.12-1.88 3.54 0 6.55 2.31 7.6 5.5l2.37-.78C21.08 11.03 17.15 8 12.5 8z"/></svg>
             </button>
-            <button
-                class="editor-btn save"
-                on:click={handleSave}
-                disabled={!hasChanges || saving}
-            >
+            <button class="tool-btn accent" on:click={handleSave} disabled={!hasChanges || saving}>
                 {saving ? "Saving…" : "Save Copy"}
             </button>
         </div>
     </header>
 
-    <!-- Main content: Canvas + Sidebar -->
-    <div class="editor-body">
-        <!-- Canvas area -->
+    <div class="editor-content">
+        <!-- ═══ ZONE 2: Tool Strip (48px left) ═══ -->
+        <div class="tool-strip">
+            <button class="strip-btn" class:active={activeTool === 'adjust'} on:click={() => activeTool = 'adjust'} title="Adjust">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z"/></svg>
+            </button>
+            <button class="strip-btn" class:active={activeTool === 'crop'} on:click={() => activeTool = 'crop'} title="Crop (coming soon)" disabled>
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M17 15h2V7c0-1.1-.9-2-2-2H9v2h8v8zM7 17V1H5v4H1v2h4v10c0 1.1.9 2 2 2h10v4h2v-4h4v-2H7z"/></svg>
+            </button>
+            <div class="strip-spacer"></div>
+            <button class="strip-btn" class:active={showPanel} on:click={() => showPanel = !showPanel} title="Toggle panel (P)">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zM6 20V4h7v5h5v11H6z"/></svg>
+            </button>
+        </div>
+
+        <!-- ═══ ZONE 3: Canvas (center) ═══ -->
         <!-- svelte-ignore a11y-no-static-element-interactions -->
         <div
-            class="editor-canvas-area"
+            class="editor-canvas-zone"
             on:wheel={handleWheel}
             on:mousedown={handleCanvasPointerDown}
             on:mousemove={handleCanvasPointerMove}
@@ -348,48 +399,76 @@
             class:zoomable={zoomLevel > 1}
         >
             {#if !imageLoaded}
-                <div class="editor-loading">
+                <div class="canvas-loading">
                     <div class="loading-spinner"></div>
                     <span>Loading image…</span>
                 </div>
             {/if}
-            <div
-                class="canvas-wrapper"
-                style="transform: scale({zoomLevel}) translate({panX / zoomLevel}px, {panY / zoomLevel}px);"
-            >
-                <canvas
-                    bind:this={canvasEl}
-                    class="editor-canvas"
-                ></canvas>
+
+            <div class="canvas-transform" style="transform: scale({zoomLevel}) translate({panX / zoomLevel}px, {panY / zoomLevel}px);">
+                <canvas bind:this={canvasEl} class="editor-canvas"></canvas>
             </div>
+
+            <!-- Floating histogram -->
+            {#if showHistogramOverlay && histogramData}
+                <div class="histogram-overlay">
+                    <Histogram data={histogramData} />
+                </div>
+            {/if}
+
+            <!-- Zoom indicator -->
+            {#if zoomLevel !== 1}
+                <div class="zoom-indicator">{zoomPercent}%</div>
+            {/if}
         </div>
 
-        <!-- Resize handle -->
-        <!-- svelte-ignore a11y-no-static-element-interactions -->
-        <div
-            class="resize-handle"
-            class:active={isResizing}
-            on:mousedown={startResize}
-        >
-            <div class="resize-grip"></div>
-        </div>
+        <!-- ═══ ZONE 4: Editing Panel (right) ═══ -->
+        {#if showPanel}
+            <!-- svelte-ignore a11y-no-static-element-interactions -->
+            <div class="resize-handle" class:active={isResizing} on:mousedown={startResize}>
+                <div class="resize-grip"></div>
+            </div>
+            <div class="editing-panel" style="width: {sidebarWidth}px;">
+                <EditingSidebar
+                    {adjustments}
+                    {histogramData}
+                    {showOriginal}
+                    on:change={onAdjustmentChange}
+                    on:resetAll={onResetAll}
+                    on:beforeAfter={onBeforeAfter}
+                />
+            </div>
+        {/if}
+    </div>
 
-        <!-- Editing Sidebar -->
-        <div class="sidebar-wrapper" style="width: {sidebarWidth}px;">
-            <EditingSidebar
-                {adjustments}
-                {histogramData}
-                {showOriginal}
-                on:change={onAdjustmentChange}
-                on:resetAll={onResetAll}
-                on:beforeAfter={onBeforeAfter}
-            />
+    <!-- ═══ ZONE 5: Filmstrip (80px bottom) ═══ -->
+    <div class="filmstrip">
+        <button class="filmstrip-nav" on:click={prevPhoto} disabled={currentPhotoIndex <= 0} title="Previous (←)">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
+        </button>
+        <div class="filmstrip-scroll" bind:this={filmstripEl}>
+            {#each filmstripPhotos as photo, i (photo.id)}
+                <button
+                    class="filmstrip-thumb"
+                    class:active={photo.id === $selectedPhoto?.id}
+                    on:click={() => navigateToPhoto(photo)}
+                    title={photo.filename}
+                >
+                    {#await (async () => { const c = getCachedThumb(photo.path); return c || convertFileSource(photo.path); })() then url}
+                        <img src={url} alt={photo.filename} draggable="false" />
+                    {/await}
+                </button>
+            {/each}
         </div>
+        <button class="filmstrip-nav" on:click={nextPhoto} disabled={currentPhotoIndex >= filmstripPhotos.length - 1} title="Next (→)">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg>
+        </button>
     </div>
 </div>
 
 <style>
-    .editor-overlay {
+    /* ═══ Shell ═══ */
+    .editor-shell {
         position: fixed;
         inset: 0;
         z-index: 600;
@@ -404,157 +483,148 @@
         to { opacity: 1; }
     }
 
-    /* ── Header ── */
-    .editor-header {
+    /* ═══ ZONE 1: Toolbar ═══ */
+    .editor-toolbar {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding: 6px 12px;
         height: 48px;
         flex-shrink: 0;
+        padding: 0 8px;
         border-bottom: 1px solid rgba(255, 255, 255, 0.06);
         background: var(--md-sys-color-surface-container, #22222a);
+        gap: 8px;
     }
 
-    .editor-title {
-        font-family: 'Outfit', 'Instrument Sans', sans-serif;
-        font-size: 14px;
-        font-weight: 600;
-        color: var(--md-sys-color-on-surface, rgba(255, 255, 255, 0.85));
-    }
-
-    .editor-actions {
+    .toolbar-left, .toolbar-center, .toolbar-right {
         display: flex;
         align-items: center;
         gap: 6px;
     }
 
-    .header-divider {
-        width: 1px;
-        height: 20px;
-        background: rgba(255,255,255,0.08);
-        margin: 0 4px;
+    .toolbar-left { min-width: 0; flex: 1; }
+    .toolbar-center { flex-shrink: 0; }
+    .toolbar-right { flex: 1; justify-content: flex-end; }
+
+    .toolbar-filename {
+        font-family: 'Outfit', sans-serif;
+        font-size: 13px;
+        font-weight: 500;
+        color: rgba(255, 255, 255, 0.6);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 200px;
     }
 
-    .editor-btn {
+    .toolbar-modified {
+        color: var(--md-sys-color-primary, #a0c4ff);
+        font-size: 10px;
+    }
+
+    .toolbar-sep {
+        width: 1px;
+        height: 20px;
+        background: rgba(255, 255, 255, 0.08);
+        margin: 0 2px;
+    }
+
+    .tool-btn {
         display: flex;
         align-items: center;
         gap: 4px;
-        padding: 5px 12px;
+        padding: 6px 10px;
         border-radius: 10px;
+        border: none;
+        background: none;
+        color: rgba(255, 255, 255, 0.6);
         font-family: 'Outfit', sans-serif;
         font-size: 12px;
         font-weight: 500;
-        color: var(--md-sys-color-on-surface-variant, rgba(255, 255, 255, 0.65));
-        background: var(--md-sys-color-surface-container-high, rgba(255,255,255,0.06));
-        border: none;
         cursor: pointer;
-        transition: all 150ms cubic-bezier(0.2, 0, 0, 1);
+        transition: all 120ms ease;
     }
 
-    .editor-btn:hover {
-        background: rgba(255, 255, 255, 0.12);
-        color: rgba(255, 255, 255, 0.9);
-    }
+    .tool-btn:hover { background: rgba(255, 255, 255, 0.08); color: rgba(255, 255, 255, 0.9); }
+    .tool-btn:disabled { opacity: 0.3; cursor: default; }
+    .tool-btn.active { background: rgba(255, 255, 255, 0.1); color: white; }
 
-    .editor-btn:disabled {
-        opacity: 0.35;
-        cursor: default;
-    }
-
-    .editor-btn.cancel {
-        color: rgba(255, 255, 255, 0.5);
-        background: transparent;
-    }
-
-    .editor-btn.cancel:hover {
-        color: rgba(255, 255, 255, 0.8);
-        background: rgba(255, 255, 255, 0.06);
-    }
-
-    .btn-icon {
-        font-size: 13px;
-    }
-
-    .editor-btn.save {
+    .tool-btn.accent {
         background: var(--md-sys-color-primary, #a0c4ff);
         color: var(--md-sys-color-on-primary, #003258);
         font-weight: 600;
+        padding: 6px 14px;
     }
+    .tool-btn.accent:hover { filter: brightness(1.1); }
+    .tool-btn.accent:disabled { opacity: 0.4; }
 
-    .editor-btn.save:hover {
-        filter: brightness(1.1);
-    }
-
-    .editor-btn.save:disabled {
-        opacity: 0.5;
-    }
-
-    /* ── Zoom Controls ── */
+    /* Zoom controls */
     .zoom-controls {
         display: flex;
         align-items: center;
-        background: var(--md-sys-color-surface-container-high, rgba(255,255,255,0.06));
+        background: rgba(255, 255, 255, 0.05);
         border-radius: 10px;
         overflow: hidden;
     }
 
     .zoom-btn {
-        width: 28px;
-        height: 28px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        background: none;
-        border: none;
-        color: rgba(255,255,255,0.6);
-        font-size: 14px;
-        font-weight: 600;
+        width: 28px; height: 28px;
+        display: flex; align-items: center; justify-content: center;
+        background: none; border: none;
+        color: rgba(255, 255, 255, 0.5);
+        font-size: 14px; font-weight: 600;
         cursor: pointer;
         transition: all 100ms ease;
     }
-
-    .zoom-btn.text {
-        font-size: 10px;
-        width: auto;
-        padding: 0 8px;
-        font-family: 'Outfit', sans-serif;
-        font-weight: 600;
-        letter-spacing: 0.5px;
-    }
-
-    .zoom-btn:hover {
-        background: rgba(255,255,255,0.1);
-        color: rgba(255,255,255,0.9);
-    }
+    .zoom-btn.text { font-size: 10px; width: auto; padding: 0 8px; font-family: 'Outfit', sans-serif; }
+    .zoom-btn:hover { background: rgba(255, 255, 255, 0.1); color: rgba(255, 255, 255, 0.9); }
 
     .zoom-label {
-        padding: 0 6px;
-        height: 28px;
-        display: flex;
-        align-items: center;
-        background: none;
-        border: none;
-        color: rgba(255,255,255,0.5);
+        padding: 0 6px; height: 28px;
+        display: flex; align-items: center; justify-content: center;
+        background: none; border: none;
+        color: rgba(255, 255, 255, 0.4);
         font-family: 'Outfit', monospace;
-        font-size: 10px;
-        cursor: pointer;
-        min-width: 40px;
-        justify-content: center;
+        font-size: 10px; cursor: pointer; min-width: 36px;
     }
+    .zoom-label:hover { color: rgba(255, 255, 255, 0.8); }
 
-    .zoom-label:hover {
-        color: rgba(255,255,255,0.8);
-    }
-
-    /* ── Body: Canvas + Sidebar ── */
-    .editor-body {
+    /* ═══ Content (tool strip + canvas + panel) ═══ */
+    .editor-content {
         flex: 1;
         display: flex;
         min-height: 0;
     }
 
-    .editor-canvas-area {
+    /* ═══ ZONE 2: Tool Strip ═══ */
+    .tool-strip {
+        width: 48px;
+        flex-shrink: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 8px 0;
+        gap: 4px;
+        background: var(--md-sys-color-surface-container, #22222a);
+        border-right: 1px solid rgba(255, 255, 255, 0.04);
+    }
+
+    .strip-btn {
+        width: 36px; height: 36px;
+        display: flex; align-items: center; justify-content: center;
+        border-radius: 10px; border: none;
+        background: none;
+        color: rgba(255, 255, 255, 0.5);
+        cursor: pointer;
+        transition: all 120ms ease;
+    }
+    .strip-btn:hover { background: rgba(255, 255, 255, 0.08); color: rgba(255, 255, 255, 0.9); }
+    .strip-btn.active { background: var(--md-sys-color-primary-container, rgba(160, 196, 255, 0.15)); color: var(--md-sys-color-on-primary-container, #a0c4ff); }
+    .strip-btn:disabled { opacity: 0.25; cursor: default; }
+    .strip-spacer { flex: 1; }
+
+    /* ═══ ZONE 3: Canvas ═══ */
+    .editor-canvas-zone {
         flex: 1;
         display: flex;
         align-items: center;
@@ -562,65 +632,92 @@
         overflow: hidden;
         position: relative;
         background: #0c0c10;
-        padding: 16px;
         min-width: 0;
     }
 
-    .editor-canvas-area.zoomable {
-        cursor: grab;
-    }
+    .editor-canvas-zone.zoomable { cursor: grab; }
+    .editor-canvas-zone.panning { cursor: grabbing; }
 
-    .editor-canvas-area.panning {
-        cursor: grabbing;
-    }
-
-    .canvas-wrapper {
+    .canvas-transform {
         display: flex;
         align-items: center;
         justify-content: center;
         max-width: 100%;
         max-height: 100%;
-        position: relative;
         transform-origin: center center;
         transition: transform 50ms ease-out;
     }
 
     .editor-canvas {
         max-width: 100%;
-        max-height: calc(100vh - 48px - 32px);
+        max-height: calc(100vh - 48px - 80px - 24px);
         object-fit: contain;
-        border-radius: 4px;
-        box-shadow: 0 4px 32px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255,255,255,0.03);
+        border-radius: 3px;
+        box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.03);
     }
 
-    .editor-loading {
+    .canvas-loading {
         position: absolute;
         inset: 0;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
+        display: flex; flex-direction: column;
+        align-items: center; justify-content: center;
         gap: 12px;
-        color: rgba(255, 255, 255, 0.5);
+        color: rgba(255, 255, 255, 0.45);
         font-family: 'Outfit', sans-serif;
         font-size: 13px;
         z-index: 2;
     }
 
     .loading-spinner {
-        width: 24px;
-        height: 24px;
+        width: 24px; height: 24px;
         border-radius: 50%;
-        border: 2px solid rgba(255, 255, 255, 0.08);
+        border: 2px solid rgba(255, 255, 255, 0.06);
         border-top-color: var(--md-sys-color-primary, #a0c4ff);
         animation: spin 0.7s linear infinite;
     }
 
-    @keyframes spin {
-        to { transform: rotate(360deg); }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Floating histogram */
+    .histogram-overlay {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        background: rgba(0, 0, 0, 0.65);
+        border-radius: 8px;
+        padding: 8px;
+        z-index: 5;
+        opacity: 0.85;
+        transition: opacity 150ms ease;
+    }
+    .histogram-overlay:hover { opacity: 1; }
+
+    /* Zoom indicator */
+    .zoom-indicator {
+        position: absolute;
+        bottom: 12px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: rgba(0, 0, 0, 0.6);
+        color: rgba(255, 255, 255, 0.7);
+        padding: 4px 12px;
+        border-radius: 12px;
+        font-family: 'Outfit', monospace;
+        font-size: 11px;
+        font-weight: 500;
+        z-index: 5;
     }
 
-    /* ── Resize Handle ── */
+    /* ═══ ZONE 4: Editing Panel ═══ */
+    .editing-panel {
+        flex-shrink: 0;
+        height: 100%;
+        min-width: 260px;
+        max-width: 480px;
+        overflow: hidden;
+    }
+
+    /* Resize handle */
     .resize-handle {
         width: 5px;
         flex-shrink: 0;
@@ -630,36 +727,78 @@
         transition: background 150ms ease;
         z-index: 10;
     }
-
-    .resize-handle:hover,
-    .resize-handle.active {
-        background: rgba(255, 255, 255, 0.04);
-    }
+    .resize-handle:hover, .resize-handle.active { background: rgba(255, 255, 255, 0.04); }
 
     .resize-grip {
         position: absolute;
-        top: 50%;
-        left: 50%;
+        top: 50%; left: 50%;
         transform: translate(-50%, -50%);
-        width: 3px;
-        height: 28px;
+        width: 3px; height: 28px;
         border-radius: 2px;
-        background: rgba(255, 255, 255, 0.1);
+        background: rgba(255, 255, 255, 0.08);
         transition: all 150ms ease;
     }
-
-    .resize-handle:hover .resize-grip,
-    .resize-handle.active .resize-grip {
+    .resize-handle:hover .resize-grip, .resize-handle.active .resize-grip {
         background: var(--md-sys-color-primary, #a0c4ff);
         height: 40px;
     }
 
-    /* ── Sidebar Wrapper ── */
-    .sidebar-wrapper {
+    /* ═══ ZONE 5: Filmstrip ═══ */
+    .filmstrip {
+        height: 80px;
         flex-shrink: 0;
-        height: 100%;
-        min-width: 260px;
-        max-width: 480px;
+        display: flex;
+        align-items: center;
+        gap: 0;
+        background: var(--md-sys-color-surface-container, #22222a);
+        border-top: 1px solid rgba(255, 255, 255, 0.06);
+        padding: 0 4px;
+    }
+
+    .filmstrip-nav {
+        width: 28px; height: 64px;
+        display: flex; align-items: center; justify-content: center;
+        background: none; border: none;
+        color: rgba(255, 255, 255, 0.4);
+        cursor: pointer;
+        border-radius: 8px;
+        flex-shrink: 0;
+        transition: all 120ms ease;
+    }
+    .filmstrip-nav:hover { background: rgba(255, 255, 255, 0.06); color: white; }
+    .filmstrip-nav:disabled { opacity: 0.2; cursor: default; }
+
+    .filmstrip-scroll {
+        flex: 1;
+        display: flex;
+        gap: 4px;
+        overflow-x: auto;
+        overflow-y: hidden;
+        padding: 8px 4px;
+        scrollbar-width: none;
+    }
+    .filmstrip-scroll::-webkit-scrollbar { display: none; }
+
+    .filmstrip-thumb {
+        width: 60px; height: 60px;
+        flex-shrink: 0;
+        border-radius: 6px;
         overflow: hidden;
+        background: rgba(255, 255, 255, 0.04);
+        border: 2px solid transparent;
+        cursor: pointer;
+        transition: all 150ms ease;
+        padding: 0;
+    }
+    .filmstrip-thumb:hover { border-color: rgba(255, 255, 255, 0.2); }
+    .filmstrip-thumb.active {
+        border-color: var(--md-sys-color-primary, #a0c4ff);
+        box-shadow: 0 0 0 1px var(--md-sys-color-primary, #a0c4ff);
+    }
+
+    .filmstrip-thumb img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
     }
 </style>

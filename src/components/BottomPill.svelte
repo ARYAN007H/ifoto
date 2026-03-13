@@ -2,6 +2,7 @@
     import { icons } from "../lib/icons";
     import { activeSection, favoritesCount, selectedPhoto } from "../lib/store";
     import type { SidebarSection } from "../lib/store";
+    import { scrollingDown } from "./PhotoGrid.svelte";
 
     function setSection(section: SidebarSection) {
         activeSection.set(section);
@@ -26,10 +27,13 @@
 
     // Hide pill when detail view is open
     $: isHidden = $selectedPhoto !== null;
+
+    // Scroll-hide: pill hides on scroll-down, shows on scroll-up
+    $: pillHidden = $scrollingDown;
 </script>
 
 {#if !isHidden}
-    <nav class="m3-nav-pill" aria-label="Navigation">
+    <nav class="m3-nav-pill" class:pill-scroll-hidden={pillHidden} aria-label="Navigation">
         <div class="pill-inner">
             {#each items as item (item.id)}
                 <button
@@ -70,6 +74,16 @@
         z-index: 900;
         animation: navPillUp 0.5s var(--ease-emphasized-decel) both;
         pointer-events: none;
+        transition:
+            transform 300ms cubic-bezier(0.2, 0, 0, 1),
+            opacity 300ms ease;
+    }
+
+    /* Scroll-hide: slide down and fade out */
+    .m3-nav-pill.pill-scroll-hidden {
+        transform: translateX(-50%) translateY(24px);
+        opacity: 0;
+        pointer-events: none !important;
     }
 
     @keyframes navPillUp {
@@ -87,13 +101,12 @@
         display: flex;
         align-items: center;
         justify-content: center;
-        gap: 8px; /* Increased gap */
-        height: 80px; /* Increased from 64px */
-        padding: 8px 16px; /* Increased padding */
-        border-radius: 40px; /* Increased rounded corners */
+        gap: 8px;
+        height: 80px;
+        padding: 8px 16px;
+        border-radius: 40px;
         background: var(--md-sys-color-surface-container);
-        backdrop-filter: blur(24px) saturate(1.6);
-        -webkit-backdrop-filter: blur(24px) saturate(1.6);
+        /* No backdrop-filter — iGPU performance rule */
         box-shadow:
             0 8px 32px rgba(0, 0, 0, 0.12),
             0 2px 8px rgba(0, 0, 0, 0.06),
@@ -114,7 +127,7 @@
         transition: color 0.2s var(--ease-emphasized);
         -webkit-tap-highlight-color: transparent;
         white-space: nowrap;
-        min-width: 72px; /* Increased from 56px */
+        min-width: 72px;
         border-radius: 20px;
     }
 
@@ -132,19 +145,19 @@
         display: flex;
         align-items: center;
         justify-content: center;
-        width: 64px; /* Increased width */
-        height: 36px; /* Increased height */
+        width: 64px;
+        height: 36px;
     }
 
     .active-bg {
         position: absolute;
         inset: 0;
         background: var(--md-sys-color-secondary-container);
-        border-radius: 18px; /* Increased */
+        border-radius: 18px;
         transform: scaleX(0);
         opacity: 0;
         transition:
-            transform 0.35s var(--ease-emphasized),
+            transform 0.35s cubic-bezier(0.34, 1.56, 0.64, 1),
             opacity 0.2s var(--ease-standard),
             border-radius 0.35s var(--ease-emphasized);
     }
@@ -167,8 +180,8 @@
     }
 
     .pill-icon :global(svg) {
-        width: 26px; /* Increased from 24px */
-        height: 26px; /* Increased from 24px */
+        width: 26px;
+        height: 26px;
     }
 
     .pill-item.active .pill-icon {
@@ -177,7 +190,7 @@
 
     /* ── Label ── */
     .pill-label {
-        font-size: 13px; /* Increased from 12px */
+        font-size: 13px;
         font-weight: 600;
         letter-spacing: 0.02em;
         line-height: 1;

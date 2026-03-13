@@ -1,5 +1,10 @@
 <script context="module">
     import { icons } from "../lib/icons";
+    import { writable } from 'svelte/store';
+    // Export scroll direction so BottomPill can react
+    export const scrollingDown = writable(false);
+    // Export long-press photo for FullBleedPreview
+    export const longPressPhoto = writable<any>(null);
 </script>
 
 <script lang="ts">
@@ -21,6 +26,12 @@
     } from "../lib/store";
     import type { Photo } from "../lib/store";
     import { getCachedThumb, cacheThumb } from "../lib/thumbnailCache";
+    import { calculateMosaicLayout, getMosaicTotalHeight, isMosaicDateBreak, type MosaicItem, type MosaicRow, type PhotoLike } from "../lib/mosaicLayout";
+    import DateBreak from "./DateBreak.svelte";
+    import { updateAmbientFromThumb, resetAmbientColor } from "../lib/ambientColor";
+
+    // Type alias: Photo satisfies PhotoLike, cast back when needed
+    type MosaicItemP = MosaicItem<Photo>;
 
     $: columnCount = getColumnCount($appSettings.gridZoom);
 
@@ -139,12 +150,18 @@
         size: number,
     ) {
         const rows: VirtualRow[] = [];
-        const gap = $appSettings.layoutMode === 'compact' ? 2 : $appSettings.layoutMode === 'expressive' ? 6 : 4;
+        const isExpressive = $appSettings.layoutMode === 'expressive';
+        const gap = $appSettings.layoutMode === 'compact' ? 2 : isExpressive ? 6 : 4;
         const headerHeight = $appSettings.layoutMode === 'compact' ? 30 : 40;
-        const sectionGap = $appSettings.layoutMode === 'compact' ? 8 : $appSettings.layoutMode === 'expressive' ? 0 : 32;
-        const rowHeight = size + gap;
+        const sectionGap = $appSettings.layoutMode === 'compact' ? 8 : isExpressive ? 0 : 32;
+        // Expressive uses grid-auto-rows: minmax(140px, 180px) with span-2 cards,
+        // so each virtual row needs to be tall enough for 2 grid-rows + gap
+        const baseRowH = isExpressive ? 180 : size;
+        const rowHeight = isExpressive ? (baseRowH * 2 + gap) : (baseRowH + gap);
 
-        const effectiveCols = $appSettings.layoutMode === 'expressive' ? 6 : cols;
+        const effectiveCols = isExpressive ? 6 : cols;
+        // In expressive mode, each chunk represents 2 visual grid rows (because of span-2 cards)
+        const chunkSize = isExpressive ? 12 : effectiveCols;
 
         let currentOffset = 0;
 
@@ -161,8 +178,8 @@
             currentOffset += headerHeight;
 
             // Pack photos into rows
-            for (let i = 0; i < group.photos.length; i += effectiveCols) {
-                const chunk = group.photos.slice(i, i + effectiveCols);
+            for (let i = 0; i < group.photos.length; i += chunkSize) {
+                const chunk = group.photos.slice(i, i + chunkSize);
                 rows.push({
                     type: 'photos',
                     height: rowHeight,
@@ -199,31 +216,121 @@
         });
     }
 
+    // ── Mosaic layout state for expressive mode ──
+    let mosaicItems: MosaicItemP[] = [];
+    let mosaicTotalHeight = 0;
+    let visibleMosaicItems: MosaicItemP[] = [];
+
+    function buildMosaicLayout(photos: Photo[], width: number) {
+        if (width <= 0 || photos.length === 0) {
+            mosaicItems = [];
+            mosaicTotalHeight = 0;
+            return;
+        }
+        const padding = 16; // padding on each side
+        const effectiveWidth = width - padding * 2;
+        mosaicItems = calculateMosaicLayout(photos, effectiveWidth, 280, 4);
+        mosaicTotalHeight = getMosaicTotalHeight(mosaicItems) + 40;
+    }
+
+    function computeVisibleMosaic() {
+        if (!mosaicItems.length) { visibleMosaicItems = []; return; }
+        const top = scrollTop;
+        const bottom = scrollTop + containerHeight;
+        const buffer = containerHeight;
+        const bTop = Math.max(0, top - buffer);
+        const bBottom = bottom + buffer;
+        visibleMosaicItems = mosaicItems.filter(item => {
+            const h = isMosaicDateBreak(item) ? item.height : (item as MosaicRow<Photo>).rowHeight;
+            const y = isMosaicDateBreak(item) ? item.yOffset : (item as MosaicRow<Photo>).yOffset;
+            return (y + h) > bTop && y < bBottom;
+        });
+    }
+
     // Rebuild layout when data or settings change
     $: {
-        const result = buildVirtualRows($groupedPhotos, columnCount, itemSize);
-        virtualRows = result.rows;
-        totalHeight = result.totalHeight;
-        // Recompute visible after layout change
-        computeVisibleRows();
+        if ($appSettings.layoutMode === 'expressive') {
+            buildMosaicLayout($filteredPhotos, containerWidth);
+            computeVisibleMosaic();
+        } else {
+            const result = buildVirtualRows($groupedPhotos, columnCount, itemSize);
+            virtualRows = result.rows;
+            totalHeight = result.totalHeight;
+            computeVisibleRows();
+        }
     }
+
+    // Effective total height for virtual scroll spacer
+    $: effectiveTotalHeight = $appSettings.layoutMode === 'expressive' ? mosaicTotalHeight : totalHeight;
 
     // ── Scroll handler (rAF-throttled) ──
     let rafId: number = 0;
+    let lastScrollY = 0;
+    const prefersReduced = typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
     function handleScroll() {
         if (rafId) return;
         rafId = requestAnimationFrame(() => {
             rafId = 0;
             if (!scrollContainer) return;
-            scrollTop = scrollContainer.scrollTop;
-            computeVisibleRows();
+            const newTop = scrollContainer.scrollTop;
+            // Track scroll direction for pill
+            scrollingDown.set(newTop > lastScrollY && newTop > 100);
+            lastScrollY = newTop;
+            scrollTop = newTop;
 
-            // Infinite scroll: load more when near bottom
-            if (scrollTop + containerHeight >= totalHeight - 600 && $hasMorePhotos && !$isLoadingMore) {
-                loadMorePhotos();
+            if ($appSettings.layoutMode === 'expressive') {
+                computeVisibleMosaic();
+                sampleAmbientColor();
+                if (scrollTop + containerHeight >= mosaicTotalHeight - 600 && $hasMorePhotos && !$isLoadingMore) {
+                    loadMorePhotos();
+                }
+            } else {
+                computeVisibleRows();
+                if (scrollTop + containerHeight >= totalHeight - 600 && $hasMorePhotos && !$isLoadingMore) {
+                    loadMorePhotos();
+                }
             }
         });
     }
+
+    // Ambient color: sample center-viewport photo's thumbnail
+    function sampleAmbientColor() {
+        if (!mosaicItems.length || !scrollContainer) return;
+        const centerY = scrollTop + containerHeight / 2;
+        // Find the mosaic row closest to center
+        for (const item of visibleMosaicItems) {
+            if (isMosaicDateBreak(item)) continue;
+            const row = item as MosaicRow<Photo>;
+            if (row.yOffset <= centerY && row.yOffset + row.rowHeight >= centerY) {
+                // Pick the center photo in this row
+                const centerPhoto = row.photos[Math.floor(row.photos.length / 2)];
+                if (centerPhoto) {
+                    const cached = getCachedThumb(centerPhoto.photo.path);
+                    if (cached) updateAmbientFromThumb(cached);
+                }
+                break;
+            }
+        }
+    }
+
+    // Long-press handler for mosaic photos
+    let longPressTimer: ReturnType<typeof setTimeout> | null = null;
+
+    function handlePointerDown(photo: Photo) {
+        if (longPressTimer) clearTimeout(longPressTimer);
+        longPressTimer = setTimeout(() => {
+            longPressPhoto.set(photo);
+        }, 500);
+    }
+
+    function handlePointerUp() {
+        if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+        longPressPhoto.set(null);
+    }
+
+    // Parallax offset (5% scroll lag, only in expressive mode)
+    $: parallaxOffset = ($appSettings.layoutMode === 'expressive' && !prefersReduced) ? scrollTop * 0.05 : 0;
 
     // ── Viewport-Aware Lazy Loading (Single Shared Observer) ──
     const cardPhotoMap = new Map<Element, Photo>();
@@ -326,31 +433,7 @@
         if (rafId) cancelAnimationFrame(rafId);
     });
 
-    // Expressive Tetris layout: aspect-aware spans with frequency limiting
-    let wideCount = 0;
-    let tallCount = 0;
-
-    function getSpanClass(photo: Photo, index: number): string {
-        if ($appSettings.layoutMode !== "expressive") return "";
-        const aspect = getPhotoAspect(photo);
-
-        if (index > 0 && index % 12 === 0) return "span-lg";
-        if (aspect > 2.5) return "span-hero";
-
-        if (aspect > 1.4) {
-            wideCount++;
-            if (wideCount % 3 === 1) return "span-wide";
-            return "";
-        }
-
-        if (aspect < 0.7) {
-            tallCount++;
-            if (tallCount % 3 === 1) return "span-tall";
-            return "";
-        }
-
-        return "";
-    }
+    // getSpanClass is no longer used — mosaic layout handles positioning
 
     function handleImgError(e: Event) {
         const target = e.currentTarget as HTMLImageElement | null;
@@ -411,108 +494,141 @@
     on:wheel={handleWheel}
     bind:this={scrollContainer}
 >
-    <!-- Virtual scroll wrapper — total height for correct scrollbar -->
-    <div class="virtual-scroll-spacer" style="height: {totalHeight}px; position: relative;">
-        {#each visibleRows as row (row.type === 'header' ? `h-${row.dateKey}` : `r-${row.groupDateKey}-${row.offsetTop}`)}
-            {#if row.type === 'header'}
-                <div
-                    class="date-section-header"
-                    style="position: absolute; top: {row.offsetTop}px; left: 0; right: 0; height: {row.height}px; padding: 0 var(--sp-5);"
-                >
-                    <div class="date-header-pill">
-                        <h2 class="date-label">{row.label}</h2>
-                        <span class="date-dot">·</span>
-                        <span class="date-count">{row.count}</span>
-                    </div>
-                </div>
-            {:else if row.photos}
-                <div
-                    class="photo-row"
-                    style="position: absolute; top: {row.offsetTop}px; left: 0; right: 0; height: {row.height}px; padding: 0 var(--sp-5); contain: layout style;"
-                >
+    <!-- Virtual scroll wrapper -->
+    <div class="virtual-scroll-spacer" style="height: {effectiveTotalHeight}px; position: relative;">
+        {#if $appSettings.layoutMode === 'expressive'}
+            <!-- Mosaic layout for expressive mode -->
+            {#each visibleMosaicItems as item, idx (isMosaicDateBreak(item) ? `db-${item.yOffset}` : `mr-${item.yOffset}`)}
+                {#if isMosaicDateBreak(item)}
                     <div
-                        class="photo-grid"
-                        style="--col-count: {columnCount}; --item-size: {itemSize}px;"
+                        style="position: absolute; top: {item.yOffset}px; left: 0; right: 0; height: {item.height}px; padding: 0 16px;"
                     >
-                        {#each row.photos as photo, photoIdx (photo.id)}
-                            <button
-                                class="photo-card group relative {getSpanClass(
-                                    photo,
-                                    photoIdx,
-                                )}"
-                                class:selected={$selectedPhotoIds.has(photo.id)}
-                                on:click={() => openPhoto(photo)}
-                                title={photo.filename}
-                                use:lazyLoad={photo}
-                                style="aspect-ratio: {$appSettings.layoutMode ===
-                                'expressive'
-                                    ? 'auto'
-                                    : $appSettings.gridZoom >= 4
-                                      ? getPhotoAspect(photo)
-                                      : '1'};"
-                            >
-                                {#if $isMultiSelectMode}
-                                    <div
-                                        class="select-checkbox"
-                                        class:checked={$selectedPhotoIds.has(photo.id)}
-                                    >
-                                        {#if $selectedPhotoIds.has(photo.id)}
-                                            <svg
-                                                viewBox="0 0 24 24"
-                                                width="14"
-                                                height="14"
-                                                fill="white"
-                                            >
-                                                <path
-                                                    d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z"
-                                                />
-                                            </svg>
-                                        {/if}
-                                    </div>
-                                {/if}
-
-                                <div class="photo-thumb">
-                                    <img
-                                        class="lazy-photo"
-                                        alt={photo.filename}
-                                        loading="lazy"
-                                        decoding="async"
-                                        draggable="false"
-                                        on:load={handleImgLoad}
-                                        on:error={handleImgError}
-                                    />
-                                    <div class="placeholder">
-                                        <span class="placeholder-icon"
-                                            >{@html icons.image || ""}</span
-                                        >
-                                    </div>
-                                </div>
-
-                                {#if photo.mediaType === "video"}
-                                    <div class="badge-video">
-                                        <span>▶</span>
-                                    </div>
-                                {/if}
-                                {#if photo.isFavorite}
-                                    <div class="badge-fav">
-                                        <svg
-                                            width="16"
-                                            height="16"
-                                            viewBox="0 0 24 24"
-                                            fill="#ff2d55"
-                                        >
-                                            <path
-                                                d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"
-                                            />
-                                        </svg>
-                                    </div>
-                                {/if}
-                            </button>
-                        {/each}
+                        <DateBreak month={item.month} year={item.year} />
                     </div>
-                </div>
-            {/if}
-        {/each}
+                {:else}
+                    <!-- Mosaic photo row: absolutely positioned photos -->
+                    {#each item.photos as lp (lp.photo.id)}
+                        <button
+                            class="mosaic-photo"
+                            class:mosaic-hero={item.isHero}
+                            class:selected={$selectedPhotoIds.has(lp.photo.id)}
+                            on:click={() => openPhoto(lp.photo)}
+                            on:pointerdown={() => handlePointerDown(lp.photo)}
+                            on:pointerup={handlePointerUp}
+                            on:pointerleave={handlePointerUp}
+                            title={lp.photo.filename}
+                            use:lazyLoad={lp.photo}
+                            style="position: absolute; top: {item.yOffset}px; left: {lp.x + 16}px; width: {lp.width}px; height: {lp.height}px; animation-delay: {Math.min(idx * 40, 400)}ms; {parallaxOffset > 0 ? `transform: translateY(${-parallaxOffset}px);` : ''}"
+                        >
+                            {#if $isMultiSelectMode}
+                                <div class="select-checkbox" class:checked={$selectedPhotoIds.has(lp.photo.id)}>
+                                    {#if $selectedPhotoIds.has(lp.photo.id)}
+                                        <svg viewBox="0 0 24 24" width="14" height="14" fill="white">
+                                            <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z" />
+                                        </svg>
+                                    {/if}
+                                </div>
+                            {/if}
+                            <div class="photo-thumb">
+                                <img
+                                    class="lazy-photo"
+                                    alt={lp.photo.filename}
+                                    loading="lazy"
+                                    decoding="async"
+                                    draggable="false"
+                                    on:load={handleImgLoad}
+                                    on:error={handleImgError}
+                                />
+                                <div class="placeholder">
+                                    <span class="placeholder-icon">{@html icons.image || ""}</span>
+                                </div>
+                            </div>
+                            {#if lp.photo.mediaType === "video"}
+                                <div class="badge-video"><span>▶</span></div>
+                            {/if}
+                            {#if lp.photo.isFavorite}
+                                <div class="badge-fav">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="#ff2d55">
+                                        <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z" />
+                                    </svg>
+                                </div>
+                            {/if}
+                        </button>
+                    {/each}
+                {/if}
+            {/each}
+        {:else}
+            <!-- Standard grid layout -->
+            {#each visibleRows as row (row.type === 'header' ? `h-${row.dateKey}` : `r-${row.groupDateKey}-${row.offsetTop}`)}
+                {#if row.type === 'header'}
+                    <div
+                        class="date-section-header"
+                        style="position: absolute; top: {row.offsetTop}px; left: 0; right: 0; height: {row.height}px; padding: 0 var(--sp-5);"
+                    >
+                        <div class="date-header-pill">
+                            <h2 class="date-label">{row.label}</h2>
+                            <span class="date-dot">·</span>
+                            <span class="date-count">{row.count}</span>
+                        </div>
+                    </div>
+                {:else if row.photos}
+                    <div
+                        class="photo-row"
+                        style="position: absolute; top: {row.offsetTop}px; left: 0; right: 0; min-height: {row.height}px; padding: 0 var(--sp-5); contain: layout style; will-change: transform;"
+                    >
+                        <div
+                            class="photo-grid"
+                            style="--col-count: {columnCount}; --item-size: {itemSize}px;"
+                        >
+                            {#each row.photos as photo, photoIdx (photo.id)}
+                                <button
+                                    class="photo-card group relative"
+                                    class:selected={$selectedPhotoIds.has(photo.id)}
+                                    on:click={() => openPhoto(photo)}
+                                    title={photo.filename}
+                                    use:lazyLoad={photo}
+                                    style="aspect-ratio: {$appSettings.gridZoom >= 4 ? getPhotoAspect(photo) : '1'};"
+                                >
+                                    {#if $isMultiSelectMode}
+                                        <div class="select-checkbox" class:checked={$selectedPhotoIds.has(photo.id)}>
+                                            {#if $selectedPhotoIds.has(photo.id)}
+                                                <svg viewBox="0 0 24 24" width="14" height="14" fill="white">
+                                                    <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z" />
+                                                </svg>
+                                            {/if}
+                                        </div>
+                                    {/if}
+                                    <div class="photo-thumb">
+                                        <img
+                                            class="lazy-photo"
+                                            alt={photo.filename}
+                                            loading="lazy"
+                                            decoding="async"
+                                            draggable="false"
+                                            on:load={handleImgLoad}
+                                            on:error={handleImgError}
+                                        />
+                                        <div class="placeholder">
+                                            <span class="placeholder-icon">{@html icons.image || ""}</span>
+                                        </div>
+                                    </div>
+                                    {#if photo.mediaType === "video"}
+                                        <div class="badge-video"><span>▶</span></div>
+                                    {/if}
+                                    {#if photo.isFavorite}
+                                        <div class="badge-fav">
+                                            <svg width="16" height="16" viewBox="0 0 24 24" fill="#ff2d55">
+                                                <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z" />
+                                            </svg>
+                                        </div>
+                                    {/if}
+                                </button>
+                            {/each}
+                        </div>
+                    </div>
+                {/if}
+            {/each}
+        {/if}
     </div>
 
     {#if $filteredPhotos.length === 0}
@@ -719,120 +835,85 @@
         padding: 4px 12px;
     }
 
-    /* ── Expressive Mode — Tetris-style Tessellating Layout ── */
+    /* ── Expressive Mode — Justified Mosaic Layout ── */
     .layout-expressive {
         padding: 0;
-        scroll-behavior: smooth;
     }
 
-    .layout-expressive .photo-grid {
-        gap: 6px;
-        grid-auto-flow: dense;
-        grid-template-columns: repeat(6, 1fr);
-        grid-auto-rows: minmax(140px, 180px);
-        padding: 6px;
+    /* Row entrance animation */
+    @keyframes photo-rise {
+        from { opacity: 0; transform: translateY(16px); }
+        to { opacity: 1; transform: translateY(0); }
     }
 
-    .layout-expressive .date-header-pill {
-        display: inline-flex;
-        position: sticky;
-        top: 8px;
-        z-index: 20;
-        margin: 8px 12px;
-        padding: 6px 16px;
-        background: var(--md-sys-color-secondary-container);
-        border-radius: var(--radius-full);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-    }
-
-    .layout-expressive .date-header-pill .date-label,
-    .layout-expressive .date-header-pill .date-count,
-    .layout-expressive .date-header-pill .date-dot {
-        color: rgba(255, 255, 255, 0.9) !important;
-    }
-
-    .layout-expressive .photo-card {
-        border-radius: 10px;
+    /* Mosaic photo tiles (absolute positioned) */
+    .mosaic-photo {
         overflow: hidden;
-        position: relative;
+        border-radius: 6px;
+        border: none;
+        padding: 0;
+        cursor: pointer;
+        background: var(--md-sys-color-surface-container, rgba(255,255,255,0.04));
+        animation: photo-rise 400ms cubic-bezier(0.2, 0, 0, 1) both;
     }
 
-    .layout-expressive .photo-card .photo-thumb {
-        border-radius: 10px;
+    @media (prefers-reduced-motion: reduce) {
+        .mosaic-photo {
+            animation: none;
+            opacity: 1;
+        }
     }
 
-    .layout-expressive .photo-card :global(.lazy-photo) {
+    .mosaic-photo .photo-thumb {
+        border-radius: 6px;
+        width: 100%;
+        height: 100%;
+    }
+
+    .mosaic-photo :global(.lazy-photo) {
         object-fit: cover;
         width: 100%;
         height: 100%;
-        transition: transform 0.5s var(--ease-emphasized);
+        transition: transform 0.4s var(--ease-emphasized);
     }
 
-    /* Cinematic hover */
-    .layout-expressive .photo-card:hover {
-        transform: none;
+    .mosaic-photo:hover {
         z-index: 10;
     }
 
-    .layout-expressive .photo-card:hover :global(.lazy-photo) {
-        transform: scale(1.05);
+    .mosaic-photo:hover :global(.lazy-photo) {
+        transform: scale(1.03);
     }
 
-    .layout-expressive .photo-card::after {
+    /* Cinematic gradient overlay on hover */
+    .mosaic-photo::after {
         content: "";
         position: absolute;
         inset: 0;
-        background: linear-gradient(
-            to top,
-            rgba(0, 0, 0, 0.3) 0%,
-            transparent 50%
-        );
+        background: linear-gradient(to top, rgba(0,0,0,0.25) 0%, transparent 40%);
         opacity: 0;
-        transition: opacity 0.3s var(--ease-standard);
+        transition: opacity 0.25s ease;
         pointer-events: none;
         border-radius: inherit;
         z-index: 2;
     }
 
-    .layout-expressive .photo-card:hover::after {
+    .mosaic-photo:hover::after {
         opacity: 1;
     }
 
-    /* ── Tetris span classes ── */
-    .layout-expressive .span-hero {
-        grid-column: span 3;
-        grid-row: span 2;
+    .mosaic-hero {
+        border-radius: 8px;
     }
 
-    .layout-expressive .span-lg {
-        grid-column: span 2;
-        grid-row: span 2;
-    }
-
-    .layout-expressive .span-wide {
-        grid-column: span 2;
-    }
-
-    .layout-expressive .span-tall {
-        grid-row: span 2;
-    }
-
-    .layout-expressive .span-featured {
-        grid-column: span 3;
-        grid-row: span 2;
-    }
-
-    /* Expressive entrance: fade-in on load */
-    .layout-expressive .photo-card .lazy-photo {
+    /* Mosaic entrance: fade-in on load */
+    .mosaic-photo :global(.lazy-photo) {
         opacity: 0;
-        transform: scale(0.97);
     }
 
-    .layout-expressive .photo-card.img-loaded .lazy-photo {
+    .mosaic-photo.img-loaded :global(.lazy-photo) {
         opacity: 1;
-        transform: scale(1);
-        transition: opacity 0.35s var(--ease-emphasized-decel),
-                    transform 0.35s var(--ease-emphasized-decel);
+        transition: opacity 0.3s var(--ease-emphasized-decel);
     }
 
     /* ── No Results ── */

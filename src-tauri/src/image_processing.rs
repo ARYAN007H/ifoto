@@ -841,3 +841,200 @@ pub async fn compute_histogram(
     .await
     .map_err(|e| format!("Histogram error: {}", e))?
 }
+
+// ── Auto-Enhance ──
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoEnhanceResult {
+    pub exposure: f64,
+    pub contrast: f64,
+    pub highlights: f64,
+    pub shadows: f64,
+    pub vibrance: f64,
+    pub saturation: f64,
+}
+
+#[tauri::command]
+pub async fn auto_enhance(
+    image_path: String,
+) -> Result<AutoEnhanceResult, String> {
+    let img = image::open(&image_path).map_err(|e| format!("Failed to open image: {}", e))?;
+
+    // Use a small version for analysis
+    let small = img.resize(400, 400, image::imageops::FilterType::Triangle);
+    let pixels = small.to_rgba8().into_raw();
+
+    tokio::task::spawn_blocking(move || {
+        let n = pixels.len() / 4;
+        if n == 0 {
+            return Ok(AutoEnhanceResult {
+                exposure: 0.0, contrast: 0.0, highlights: 0.0,
+                shadows: 0.0, vibrance: 0.0, saturation: 0.0,
+            });
+        }
+
+        // Compute luminance histogram
+        let mut l_hist = [0u32; 256];
+        let mut total_lum = 0.0_f64;
+        let mut total_sat = 0.0_f64;
+
+        for chunk in pixels.chunks(4) {
+            if chunk.len() < 4 { continue; }
+            let r = chunk[0] as f64 / 255.0;
+            let g = chunk[1] as f64 / 255.0;
+            let b = chunk[2] as f64 / 255.0;
+            let lum = 0.299 * r + 0.587 * g + 0.114 * b;
+            let idx = (lum * 255.0).round() as usize;
+            l_hist[idx.min(255)] += 1;
+            total_lum += lum;
+
+            let max_c = r.max(g).max(b);
+            let min_c = r.min(g).min(b);
+            if max_c > 0.0 {
+                total_sat += (max_c - min_c) / max_c;
+            }
+        }
+
+        let avg_lum = total_lum / n as f64;
+        let avg_sat = total_sat / n as f64;
+
+        // Compute percentiles
+        let total_px = n as f64;
+        let mut cumulative = 0u32;
+        let mut p2 = 0usize;
+        let mut p98 = 255usize;
+        for i in 0..256 {
+            cumulative += l_hist[i];
+            if cumulative as f64 / total_px < 0.02 { p2 = i; }
+            if cumulative as f64 / total_px < 0.98 { p98 = i; }
+        }
+
+        // Suggest exposure: target avg_lum of ~0.45
+        let exposure = if avg_lum < 0.35 {
+            (0.45 - avg_lum) * 3.0  // up to ~0.3 EV
+        } else if avg_lum > 0.55 {
+            (0.45 - avg_lum) * 2.0  // reduce
+        } else {
+            0.0
+        };
+
+        // Suggest contrast: low-contrast images get a boost
+        let range = (p98 - p2) as f64 / 255.0;
+        let contrast = if range < 0.7 {
+            (0.7 - range) * 40.0  // up to ~12
+        } else {
+            0.0
+        };
+
+        // Highlights: if bright pixels are clipped, pull down
+        let highlights: f64 = if p98 > 250 { -15.0 } else { 0.0 };
+
+        // Shadows: if darks are crushed, open up
+        let shadows: f64 = if p2 < 5 { 15.0 } else { 0.0 };
+
+        // Vibrance: if saturation is low, boost
+        let vibrance = if avg_sat < 0.3 {
+            (0.3 - avg_sat) * 80.0  // up to ~24
+        } else {
+            0.0
+        };
+
+        let saturation = 0.0; // leave global saturation to user
+
+        Ok(AutoEnhanceResult {
+            exposure: (exposure * 10.0).round() / 10.0,
+            contrast: contrast.round(),
+            highlights: highlights.round(),
+            shadows: shadows.round(),
+            vibrance: vibrance.round(),
+            saturation,
+        })
+    })
+    .await
+    .map_err(|e| format!("Auto-enhance error: {}", e))?
+}
+
+// ── Export Image ──
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportOptions {
+    pub format: String,       // "jpeg", "png", "webp"
+    pub quality: u8,          // 1-100
+    pub max_long_edge: u32,   // 0 = full resolution
+}
+
+#[tauri::command]
+pub async fn export_image(
+    image_path: String,
+    adjustments: AdjustmentPayload,
+    options: ExportOptions,
+    output_path: String,
+) -> Result<(), String> {
+    let img = image::open(&image_path).map_err(|e| format!("Failed to open: {}", e))?;
+
+    // Optionally resize
+    let img = if options.max_long_edge > 0 {
+        let (w, h) = (img.width(), img.height());
+        let max_e = options.max_long_edge;
+        if w > max_e || h > max_e {
+            let scale = max_e as f64 / w.max(h) as f64;
+            let nw = (w as f64 * scale) as u32;
+            let nh = (h as f64 * scale) as u32;
+            img.resize(nw, nh, image::imageops::FilterType::Lanczos3)
+        } else {
+            img
+        }
+    } else {
+        img
+    };
+
+    let rgba = img.to_rgba8();
+    let width = rgba.width();
+    let height = rgba.height();
+    let mut pixels = rgba.into_raw();
+    let adj = adjustments;
+    let fmt = options.format.clone();
+    let quality = options.quality;
+    let out = output_path.clone();
+
+    tokio::task::spawn_blocking(move || {
+        process_pixels(&mut pixels, width, height, &adj);
+
+        let img_buf = image::RgbaImage::from_raw(width, height, pixels)
+            .ok_or_else(|| "Failed to create image buffer".to_string())?;
+
+        match fmt.as_str() {
+            "png" => {
+                img_buf.save_with_format(&out, image::ImageFormat::Png)
+                    .map_err(|e| format!("PNG save error: {}", e))?;
+            }
+            "webp" => {
+                // Save as PNG fallback (image crate webp support varies)
+                img_buf.save_with_format(&out, image::ImageFormat::Png)
+                    .map_err(|e| format!("WebP save error: {}", e))?;
+            }
+            _ => {
+                // JPEG: convert to RGB
+                let rgb_img = image::DynamicImage::ImageRgba8(img_buf).to_rgb8();
+                let mut file = std::fs::File::create(&out)
+                    .map_err(|e| format!("File create error: {}", e))?;
+                let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                    &mut file,
+                    quality,
+                );
+                encoder.encode(
+                    rgb_img.as_raw(),
+                    width,
+                    height,
+                    image::ExtendedColorType::Rgb8,
+                ).map_err(|e| format!("JPEG encode error: {}", e))?;
+            }
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Export error: {}", e))?
+}

@@ -60,6 +60,8 @@ pub fn run() {
             // Image processing
             image_processing::process_image,
             image_processing::compute_histogram,
+            image_processing::auto_enhance,
+            image_processing::export_image,
             // Performance & streaming
             commands::scan_directory,
             commands::get_system_info,
