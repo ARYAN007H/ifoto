@@ -4,7 +4,7 @@
     // Export scroll direction so BottomPill can react
     export const scrollingDown = writable(false);
     // Export long-press photo for FullBleedPreview
-    export const longPressPhoto = writable<any>(null);
+    export const longPressPhoto = writable(null);
 </script>
 
 <script lang="ts">
@@ -148,20 +148,23 @@
         groups: { label: string; dateKey: string; photos: Photo[] }[],
         cols: number,
         size: number,
+        cWidth: number
     ) {
         const rows: VirtualRow[] = [];
         const isExpressive = $appSettings.layoutMode === 'expressive';
         const gap = $appSettings.layoutMode === 'compact' ? 2 : isExpressive ? 6 : 4;
         const headerHeight = $appSettings.layoutMode === 'compact' ? 30 : 40;
         const sectionGap = $appSettings.layoutMode === 'compact' ? 8 : isExpressive ? 0 : 32;
-        // Expressive uses grid-auto-rows: minmax(140px, 180px) with span-2 cards,
-        // so each virtual row needs to be tall enough for 2 grid-rows + gap
-        const baseRowH = isExpressive ? 180 : size;
-        const rowHeight = isExpressive ? (baseRowH * 2 + gap) : (baseRowH + gap);
 
         const effectiveCols = isExpressive ? 6 : cols;
-        // In expressive mode, each chunk represents 2 visual grid rows (because of span-2 cards)
         const chunkSize = isExpressive ? 12 : effectiveCols;
+
+        // Calculate actual dynamically sized width to prevent overlap
+        // normal mode has padding: 0 var(--sp-5) -> 20px padding each side = 40px
+        const padding = $appSettings.layoutMode === 'compact' ? 4 : isExpressive ? 0 : 40;
+        const availableW = Math.max(0, cWidth - padding);
+        const colW = (availableW - gap * (effectiveCols - 1)) / effectiveCols;
+        const zoom = $appSettings.gridZoom;
 
         let currentOffset = 0;
 
@@ -180,14 +183,29 @@
             // Pack photos into rows
             for (let i = 0; i < group.photos.length; i += chunkSize) {
                 const chunk = group.photos.slice(i, i + chunkSize);
+                
+                let rowH = isExpressive ? (180 * 2 + gap) : colW;
+                
+                if (!isExpressive && zoom >= 4) {
+                    let maxH = 0;
+                    for (const p of chunk) {
+                        const aspect = getPhotoAspect(p);
+                        const h = colW / aspect;
+                        if (h > maxH) maxH = h;
+                    }
+                    rowH = maxH;
+                }
+                
+                const finalRowHeight = rowH + gap;
+
                 rows.push({
                     type: 'photos',
-                    height: rowHeight,
+                    height: finalRowHeight,
                     offsetTop: currentOffset,
                     photos: chunk,
                     groupDateKey: group.dateKey,
                 });
-                currentOffset += rowHeight;
+                currentOffset += finalRowHeight;
             }
 
             currentOffset += sectionGap;
@@ -253,7 +271,7 @@
             buildMosaicLayout($filteredPhotos, containerWidth);
             computeVisibleMosaic();
         } else {
-            const result = buildVirtualRows($groupedPhotos, columnCount, itemSize);
+            const result = buildVirtualRows($groupedPhotos, columnCount, itemSize, containerWidth);
             virtualRows = result.rows;
             totalHeight = result.totalHeight;
             computeVisibleRows();
@@ -446,7 +464,7 @@
     function handleImgLoad(e: Event) {
         const target = e.currentTarget as HTMLImageElement | null;
         if (target) {
-            const card = target.closest(".photo-card");
+            const card = target.closest(".photo-card, .mosaic-photo");
             if (card) card.classList.add("img-loaded");
         }
     }
@@ -775,7 +793,9 @@
         transition: opacity var(--duration-base) var(--ease-standard);
     }
 
-    .photo-card.img-loaded .placeholder {
+    .photo-card.img-loaded .placeholder,
+    .mosaic-photo.img-loaded .placeholder,
+    :global(.mosaic-photo .lazy-photo[src]:not([src=""])) ~ .placeholder {
         opacity: 0;
         pointer-events: none;
         animation: none;
@@ -909,11 +929,12 @@
     /* Mosaic entrance: fade-in on load */
     .mosaic-photo :global(.lazy-photo) {
         opacity: 0;
+        transition: opacity 0.3s var(--ease-emphasized-decel);
     }
 
-    .mosaic-photo.img-loaded :global(.lazy-photo) {
+    .mosaic-photo.img-loaded :global(.lazy-photo),
+    .mosaic-photo :global(.lazy-photo[src]:not([src=""])) {
         opacity: 1;
-        transition: opacity 0.3s var(--ease-emphasized-decel);
     }
 
     /* ── No Results ── */
