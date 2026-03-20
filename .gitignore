@@ -25,3 +25,9 @@ dist-ssr
 src-tauri/target/
 vscode_history_flatpak/*
 vscode_history_oss/-4a8c90a/*
+
+# Local envs and temporary agent files
+.env
+.env.*
+check_output*.txt
+.agent/

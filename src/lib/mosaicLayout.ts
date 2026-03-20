@@ -64,10 +64,10 @@ export function calculateMosaicLayout<T extends PhotoLike>(
     const aspects = photos.map(getAspectRatio);
     const n = photos.length;
 
-    // ── Step 1: Identify hero photos (panoramas & extreme portraits) ──
+    // ── Step 1: Identify hero photos (panoramas) ──
     const heroIndices = new Set<number>();
     for (let i = 0; i < n; i++) {
-        if (aspects[i] >= 2.8 || aspects[i] <= 0.5) {
+        if (aspects[i] >= 2.8) {
             heroIndices.add(i);
         }
     }
