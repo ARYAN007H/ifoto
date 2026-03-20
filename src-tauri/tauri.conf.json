@@ -1,6 +1,6 @@
 {
     "productName": "Galleria Expressive",
-    "version": "0.12.2",
+    "version": "0.13.0",
     "identifier": "com.galleria.app",
     "build": {
         "beforeDevCommand": "npm run dev",
@@ -51,5 +51,13 @@
         "category": "Photography",
         "shortDescription": "Photo and media viewer with Liquid Glass UI",
         "longDescription": "View and organize photos and media. Select a directory, scan and categorize, search with natural language."
+    },
+    "plugins": {
+        "updater": {
+            "endpoints": [
+                "https://github.com/ARYAN007H/Galleria-Expressive/releases/latest/download/latest.json"
+            ],
+            "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY1QzhGQ0JGNDI5QTBGNEYKUldSUEQ1cEN2L3pJOVlsRFdzaHlIVUlEUzMrOWJJdWVZcVAzTUgvS2ZzeWJhcDRIaFd6djhBZWgK"
+        }
     }
 }

@@ -1,5 +1,8 @@
 # Photo Sorter Update Logs
 
+### **v0.13.0** - 2026-03-20
+* **Feature**: Added a built-in OTA Auto-Updater! You can now effortlessly check for updates within **Settings > General** and the app will flawlessly download and install updates automatically in the background.
+
 ### **v0.12.2** - 2026-03-20
 * **Fix**: Safely disabled the faulty WebKit DMA-BUF hardware renderer exclusively on Linux environments to prevent the fatal Nvidia `EGL_BAD_PARAMETER` startup crash.
 

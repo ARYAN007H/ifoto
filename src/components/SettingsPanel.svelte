@@ -1,5 +1,6 @@
 <script lang="ts">
     import { icons } from "../lib/icons";
+    import { check } from "@tauri-apps/plugin-updater";
     import {
         appSettings,
         showSettings,
@@ -106,6 +107,34 @@
 
     function isFolderPinned(folder: string): boolean {
         return $appSettings.pinnedFolders.includes(folder);
+    }
+
+    let updateStatus = "";
+    let isCheckingUpdate = false;
+    
+    async function checkForUpdates() {
+        if (isCheckingUpdate) return;
+        isCheckingUpdate = true;
+        updateStatus = "Checking for updates...";
+        try {
+            const update = await check();
+            if (update) {
+                updateStatus = `Downloading v${update.version}...`;
+                await update.downloadAndInstall();
+                updateStatus = "Update installed! Please restart the app.";
+            } else {
+                updateStatus = "You are on the latest version.";
+            }
+        } catch (e) {
+            updateStatus = "Failed to update: " + e;
+        }
+        isCheckingUpdate = false;
+        
+        setTimeout(() => {
+            if (updateStatus === "You are on the latest version." || updateStatus.startsWith("Failed")) {
+                updateStatus = "";
+            }
+        }, 3000);
     }
 </script>
 
@@ -277,6 +306,27 @@
                                     <span class="toggle-thumb"></span>
                                 </span>
                             </label>
+                        </div>
+
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <span class="setting-icon">{@html icons.settings}</span>
+                                <div>
+                                    <p class="setting-label">Software Update</p>
+                                    <p class="setting-desc">Check for and automatically install the latest OTA releases</p>
+                                    {#if updateStatus}
+                                        <span class="perf-chip manual" style="margin-top: 4px; background: var(--md-sys-color-primary-container); color: var(--md-sys-color-on-primary-container)">{updateStatus}</span>
+                                    {/if}
+                                </div>
+                            </div>
+                            <button 
+                                class="tab-btn" 
+                                style="background: var(--md-sys-color-secondary-container); color: var(--md-sys-color-on-secondary-container); padding: 8px 16px; border-radius: 8px;"
+                                on:click={checkForUpdates}
+                                disabled={isCheckingUpdate}
+                            >
+                                {isCheckingUpdate ? "Checking..." : "Check"}
+                            </button>
                         </div>
                     </div>
 
