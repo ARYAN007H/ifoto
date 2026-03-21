@@ -1,6 +1,34 @@
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
+use std::sync::Mutex;
+
+// ── Editor State (source image cache) ──
+
+pub struct EditorState {
+    pub cached_source: Mutex<Option<CachedImage>>,
+    pub preview_path: Mutex<String>,
+}
+
+pub struct CachedImage {
+    pub path: String,
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Default for EditorState {
+    fn default() -> Self {
+        let preview_path = std::env::temp_dir()
+            .join("galleria_preview.bmp")
+            .to_string_lossy()
+            .to_string();
+        Self {
+            cached_source: Mutex::new(None),
+            preview_path: Mutex::new(preview_path),
+        }
+    }
+}
 
 // ── Adjustment Payload (mirrors frontend state) ──
 
@@ -147,7 +175,7 @@ pub struct AdjustmentPayload {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessResult {
-    pub data: String,     // base64-encoded RGBA
+    pub preview_path: String,  // temp file path for frontend to load
     pub width: u32,
     pub height: u32,
 }
@@ -356,18 +384,345 @@ fn hsl_range_weight(hue: f64, center: f64) -> f64 {
 // ── White Balance (temperature/tint to RGB multipliers) ──
 
 fn temperature_to_rgb_mults(temp_k: f64) -> (f64, f64, f64) {
-    // Simplified Planckian locus approximation
-    // Reference: 6500K = neutral
-    let t = temp_k.max(2000.0).min(50000.0);
-    let t_norm = (t - 6500.0) / 6500.0;
+    // CIE D-illuminant based white balance
+    // Reference: D65 (6500K) = neutral
+    let t = temp_k.max(2000.0).min(25000.0);
+    let t2 = t * t;
+    let t3 = t2 * t;
 
-    // Warm → boost red, reduce blue; Cool → boost blue, reduce red
-    let r_mult = 1.0 + t_norm * 0.15;
-    let b_mult = 1.0 - t_norm * 0.15;
+    // CIE daylight illuminant xy chromaticity
+    let x = if t <= 7000.0 {
+        -4.607e9 / t3 + 2.9678e6 / t2 + 0.09911e3 / t + 0.244063
+    } else {
+        -2.0064e9 / t3 + 1.9018e6 / t2 + 0.24748e3 / t + 0.237040
+    };
+    let y = -3.0 * x * x + 2.87 * x - 0.275;
+
+    // D65 reference chromaticity
+    let ref_x = 0.31271;
+    let ref_y = 0.32902;
+
+    // Simplified Bradford-like adaptation
+    let dx = x - ref_x;
+    let dy = y - ref_y;
+    let r_mult = (1.0 + dx * 4.5 - dy * 1.5).max(0.4).min(2.5);
+    let b_mult = (1.0 - dx * 1.5 + dy * 4.5).max(0.4).min(2.5);
     (r_mult, 1.0, b_mult)
 }
 
-// ── Simple pseudo-random for grain ──
+// ── Separable Gaussian Blur (foundation for spatial ops) ──
+
+fn build_gaussian_kernel(sigma: f64) -> Vec<f64> {
+    let radius = (sigma * 2.5).ceil() as usize;
+    let size = radius * 2 + 1;
+    let mut kernel = vec![0.0f64; size];
+    let s2 = 2.0 * sigma * sigma;
+    let mut sum = 0.0;
+    for i in 0..size {
+        let x = i as f64 - radius as f64;
+        kernel[i] = (-x * x / s2).exp();
+        sum += kernel[i];
+    }
+    for v in kernel.iter_mut() { *v /= sum; }
+    kernel
+}
+
+/// Gaussian blur on a single-channel f64 buffer (w×h)
+fn gaussian_blur_channel(src: &[f64], w: usize, h: usize, sigma: f64) -> Vec<f64> {
+    if sigma < 0.3 { return src.to_vec(); }
+    let kernel = build_gaussian_kernel(sigma);
+    let radius = kernel.len() / 2;
+
+    // Horizontal pass
+    let mut temp = vec![0.0f64; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut sum = 0.0;
+            for k in 0..kernel.len() {
+                let sx = (x as isize + k as isize - radius as isize)
+                    .max(0).min(w as isize - 1) as usize;
+                sum += src[y * w + sx] * kernel[k];
+            }
+            temp[y * w + x] = sum;
+        }
+    }
+
+    // Vertical pass
+    let mut out = vec![0.0f64; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut sum = 0.0;
+            for k in 0..kernel.len() {
+                let sy = (y as isize + k as isize - radius as isize)
+                    .max(0).min(h as isize - 1) as usize;
+                sum += temp[sy * w + x] * kernel[k];
+            }
+            out[y * w + x] = sum;
+        }
+    }
+    out
+}
+
+/// Apply clarity (local contrast at large radius) to RGBA pixel buffer
+fn apply_clarity(pixels: &mut [u8], w: usize, h: usize, strength: f64) {
+    if strength.abs() < 0.001 { return; }
+    let amt = strength / 100.0 * 0.6;
+
+    // Extract luminance channel
+    let mut lum = vec![0.0f64; w * h];
+    for i in 0..(w * h) {
+        let r = pixels[i * 4] as f64 / 255.0;
+        let g = pixels[i * 4 + 1] as f64 / 255.0;
+        let b = pixels[i * 4 + 2] as f64 / 255.0;
+        lum[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+    }
+
+    // Blur at large radius for local contrast
+    let sigma = (w.min(h) as f64 * 0.02).max(8.0).min(30.0);
+    let blurred = gaussian_blur_channel(&lum, w, h, sigma);
+
+    // Apply: boost difference between original and blurred luminance
+    for i in 0..(w * h) {
+        let diff = lum[i] - blurred[i];
+        let boost = 1.0 + amt * diff.signum() * diff.abs().sqrt() * 2.0;
+        for c in 0..3 {
+            let v = pixels[i * 4 + c] as f64 / 255.0;
+            let nv = (v * boost).max(0.0).min(1.0);
+            pixels[i * 4 + c] = (nv * 255.0 + 0.5) as u8;
+        }
+    }
+}
+
+/// Apply texture (local contrast at small radius, luminance-preserving)
+fn apply_texture(pixels: &mut [u8], w: usize, h: usize, strength: f64) {
+    if strength.abs() < 0.001 { return; }
+    let amt = strength / 100.0 * 0.4;
+
+    let mut lum = vec![0.0f64; w * h];
+    for i in 0..(w * h) {
+        let r = pixels[i * 4] as f64 / 255.0;
+        let g = pixels[i * 4 + 1] as f64 / 255.0;
+        let b = pixels[i * 4 + 2] as f64 / 255.0;
+        lum[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+    }
+
+    let blurred = gaussian_blur_channel(&lum, w, h, 2.0);
+
+    for i in 0..(w * h) {
+        let detail = lum[i] - blurred[i];
+        let boost = amt * detail * 3.0;
+        for c in 0..3 {
+            let v = pixels[i * 4 + c] as f64 / 255.0;
+            pixels[i * 4 + c] = ((v + boost).max(0.0).min(1.0) * 255.0 + 0.5) as u8;
+        }
+    }
+}
+
+/// Apply dehaze using simplified dark channel prior
+fn apply_dehaze(pixels: &mut [u8], w: usize, h: usize, strength: f64) {
+    if strength.abs() < 0.001 { return; }
+    let amt = strength / 100.0;
+
+    // Compute per-pixel dark channel (min of RGB)
+    let mut dark = vec![0.0f64; w * h];
+    for i in 0..(w * h) {
+        let r = pixels[i * 4] as f64 / 255.0;
+        let g = pixels[i * 4 + 1] as f64 / 255.0;
+        let b = pixels[i * 4 + 2] as f64 / 255.0;
+        dark[i] = r.min(g).min(b);
+    }
+
+    // Blur the dark channel to get local atmospheric estimate
+    let sigma = (w.min(h) as f64 * 0.01).max(5.0).min(15.0);
+    let atm = gaussian_blur_channel(&dark, w, h, sigma);
+
+    // Estimate atmospheric light (bright region average)
+    let atm_light = 0.95_f64; // simplified: assume near-white atmosphere
+
+    for i in 0..(w * h) {
+        let transmission = (1.0 - amt * atm[i] / atm_light).max(0.1);
+        for c in 0..3 {
+            let v = pixels[i * 4 + c] as f64 / 255.0;
+            let dehazed = (v - atm_light * (1.0 - transmission)) / transmission;
+            pixels[i * 4 + c] = (dehazed.max(0.0).min(1.0) * 255.0 + 0.5) as u8;
+        }
+    }
+}
+
+/// Unsharp mask sharpening
+fn apply_sharpening(pixels: &mut [u8], w: usize, h: usize, amount: f64, radius: f64, _detail: f64, masking: f64) {
+    if amount < 0.001 { return; }
+    let amt = amount / 150.0;
+
+    let mut lum = vec![0.0f64; w * h];
+    for i in 0..(w * h) {
+        let r = pixels[i * 4] as f64 / 255.0;
+        let g = pixels[i * 4 + 1] as f64 / 255.0;
+        let b = pixels[i * 4 + 2] as f64 / 255.0;
+        lum[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+    }
+
+    let blurred = gaussian_blur_channel(&lum, w, h, radius.max(0.5).min(3.0));
+
+    // Edge masking: only sharpen edges (high local contrast areas)
+    let mask_threshold = masking / 100.0 * 0.1;
+
+    for i in 0..(w * h) {
+        let detail_val = lum[i] - blurred[i];
+        // Masking: suppress sharpening in smooth areas
+        let edge_strength = detail_val.abs();
+        if edge_strength < mask_threshold { continue; }
+
+        let sharpen = amt * detail_val * 2.0;
+        for c in 0..3 {
+            let v = pixels[i * 4 + c] as f64 / 255.0;
+            pixels[i * 4 + c] = ((v + sharpen).max(0.0).min(1.0) * 255.0 + 0.5) as u8;
+        }
+    }
+}
+
+/// Simplified noise reduction via edge-preserving blur
+fn apply_noise_reduction(pixels: &mut [u8], w: usize, h: usize, lum_strength: f64, color_strength: f64) {
+    // Luminance NR: blur luminance channel, blend back
+    if lum_strength > 0.5 {
+        let amt = lum_strength / 100.0 * 0.7;
+        let mut lum = vec![0.0f64; w * h];
+        for i in 0..(w * h) {
+            let r = pixels[i * 4] as f64 / 255.0;
+            let g = pixels[i * 4 + 1] as f64 / 255.0;
+            let b = pixels[i * 4 + 2] as f64 / 255.0;
+            lum[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+        }
+        let blurred = gaussian_blur_channel(&lum, w, h, 1.5 + lum_strength / 30.0);
+
+        for i in 0..(w * h) {
+            let diff = (lum[i] - blurred[i]).abs();
+            // Only smooth areas with small differences (noise), preserve edges
+            let blend = if diff < 0.05 { amt } else { amt * (0.05 / diff).min(1.0) };
+            let new_lum = lum[i] * (1.0 - blend) + blurred[i] * blend;
+            let ratio = if lum[i] > 0.001 { new_lum / lum[i] } else { 1.0 };
+            for c in 0..3 {
+                let v = pixels[i * 4 + c] as f64 / 255.0;
+                pixels[i * 4 + c] = ((v * ratio).max(0.0).min(1.0) * 255.0 + 0.5) as u8;
+            }
+        }
+    }
+
+    // Color NR: blur chrominance
+    if color_strength > 0.5 {
+        let amt = color_strength / 100.0 * 0.8;
+        let sigma = 2.0 + color_strength / 25.0;
+        // Extract Cb/Cr-like channels
+        let mut cb = vec![0.0f64; w * h];
+        let mut cr = vec![0.0f64; w * h];
+        for i in 0..(w * h) {
+            let r = pixels[i * 4] as f64 / 255.0;
+            let g = pixels[i * 4 + 1] as f64 / 255.0;
+            let b = pixels[i * 4 + 2] as f64 / 255.0;
+            let y = 0.299 * r + 0.587 * g + 0.114 * b;
+            cb[i] = b - y;
+            cr[i] = r - y;
+        }
+        let cb_blur = gaussian_blur_channel(&cb, w, h, sigma);
+        let cr_blur = gaussian_blur_channel(&cr, w, h, sigma);
+
+        for i in 0..(w * h) {
+            let r = pixels[i * 4] as f64 / 255.0;
+            let g = pixels[i * 4 + 1] as f64 / 255.0;
+            let b = pixels[i * 4 + 2] as f64 / 255.0;
+            let y = 0.299 * r + 0.587 * g + 0.114 * b;
+            let new_cb = cb[i] * (1.0 - amt) + cb_blur[i] * amt;
+            let new_cr = cr[i] * (1.0 - amt) + cr_blur[i] * amt;
+            pixels[i * 4]     = ((y + new_cr).max(0.0).min(1.0) * 255.0 + 0.5) as u8;
+            pixels[i * 4 + 1] = ((y - 0.344136 * new_cb - 0.714136 * new_cr).max(0.0).min(1.0) * 255.0 + 0.5) as u8;
+            pixels[i * 4 + 2] = ((y + new_cb).max(0.0).min(1.0) * 255.0 + 0.5) as u8;
+        }
+    }
+}
+
+/// Barrel/pincushion lens distortion correction
+fn apply_lens_distortion(pixels: &mut [u8], w: usize, h: usize, strength: f64) {
+    if strength.abs() < 0.001 { return; }
+    let k = strength / 100.0 * 0.3; // distortion coefficient
+    let cx = w as f64 / 2.0;
+    let cy = h as f64 / 2.0;
+    let max_r = (cx * cx + cy * cy).sqrt();
+
+    let src = pixels.to_vec();
+    for y in 0..h {
+        for x in 0..w {
+            let dx = (x as f64 - cx) / max_r;
+            let dy = (y as f64 - cy) / max_r;
+            let r2 = dx * dx + dy * dy;
+            let factor = 1.0 + k * r2;
+            let sx = cx + dx * factor * max_r;
+            let sy = cy + dy * factor * max_r;
+
+            let idx = (y * w + x) * 4;
+            if sx >= 0.0 && sx < (w - 1) as f64 && sy >= 0.0 && sy < (h - 1) as f64 {
+                // Bilinear interpolation
+                let x0 = sx.floor() as usize;
+                let y0 = sy.floor() as usize;
+                let fx = sx - x0 as f64;
+                let fy = sy - y0 as f64;
+                for c in 0..3 {
+                    let v00 = src[(y0 * w + x0) * 4 + c] as f64;
+                    let v10 = src[(y0 * w + x0 + 1) * 4 + c] as f64;
+                    let v01 = src[((y0 + 1) * w + x0) * 4 + c] as f64;
+                    let v11 = src[((y0 + 1) * w + x0 + 1) * 4 + c] as f64;
+                    let v = v00 * (1.0 - fx) * (1.0 - fy) + v10 * fx * (1.0 - fy)
+                          + v01 * (1.0 - fx) * fy + v11 * fx * fy;
+                    pixels[idx + c] = v.max(0.0).min(255.0) as u8;
+                }
+            } else {
+                pixels[idx] = 0;
+                pixels[idx + 1] = 0;
+                pixels[idx + 2] = 0;
+            }
+        }
+    }
+}
+
+/// Chromatic aberration correction (per-channel radial scaling)
+fn apply_ca_correction(pixels: &mut [u8], w: usize, h: usize, ca_red: f64, ca_blue: f64) {
+    if ca_red.abs() < 0.001 && ca_blue.abs() < 0.001 { return; }
+    let cx = w as f64 / 2.0;
+    let cy = h as f64 / 2.0;
+    let r_scale = 1.0 + ca_red / 100.0 * 0.005;
+    let b_scale = 1.0 + ca_blue / 100.0 * 0.005;
+
+    let src = pixels.to_vec();
+    for y in 0..h {
+        for x in 0..w {
+            let idx = (y * w + x) * 4;
+            // Red channel: sample from scaled position
+            let rx = cx + (x as f64 - cx) * r_scale;
+            let ry = cy + (y as f64 - cy) * r_scale;
+            if rx >= 0.0 && rx < (w - 1) as f64 && ry >= 0.0 && ry < (h - 1) as f64 {
+                let x0 = rx.floor() as usize; let y0 = ry.floor() as usize;
+                let fx = rx - x0 as f64; let fy = ry - y0 as f64;
+                let v = src[(y0 * w + x0) * 4] as f64 * (1.0 - fx) * (1.0 - fy)
+                      + src[(y0 * w + x0 + 1) * 4] as f64 * fx * (1.0 - fy)
+                      + src[((y0 + 1) * w + x0) * 4] as f64 * (1.0 - fx) * fy
+                      + src[((y0 + 1) * w + x0 + 1) * 4] as f64 * fx * fy;
+                pixels[idx] = v.max(0.0).min(255.0) as u8;
+            }
+            // Blue channel
+            let bx = cx + (x as f64 - cx) * b_scale;
+            let by = cy + (y as f64 - cy) * b_scale;
+            if bx >= 0.0 && bx < (w - 1) as f64 && by >= 0.0 && by < (h - 1) as f64 {
+                let x0 = bx.floor() as usize; let y0 = by.floor() as usize;
+                let fx = bx - x0 as f64; let fy = by - y0 as f64;
+                let v = src[(y0 * w + x0) * 4 + 2] as f64 * (1.0 - fx) * (1.0 - fy)
+                      + src[(y0 * w + x0 + 1) * 4 + 2] as f64 * fx * (1.0 - fy)
+                      + src[((y0 + 1) * w + x0) * 4 + 2] as f64 * (1.0 - fx) * fy
+                      + src[((y0 + 1) * w + x0 + 1) * 4 + 2] as f64 * fx * fy;
+                pixels[idx + 2] = v.max(0.0).min(255.0) as u8;
+            }
+        }
+    }
+}
+
 
 #[inline(always)]
 fn hash_pixel(x: u32, y: u32, seed: u32) -> f64 {
@@ -679,6 +1034,43 @@ fn process_pixels(
         chunk[2] = (clamp01(b) * 255.0 + 0.5) as u8;
     });
 
+    // ── Post-pixel spatial operations (order matters!) ──
+
+    // Texture (small-radius local contrast)
+    if adj.texture.abs() > 0.001 {
+        apply_texture(pixels, w, h, adj.texture);
+    }
+
+    // Clarity (large-radius local contrast)
+    if adj.clarity.abs() > 0.001 {
+        apply_clarity(pixels, w, h, adj.clarity);
+    }
+
+    // Dehaze (dark channel prior)
+    if adj.dehaze.abs() > 0.001 {
+        apply_dehaze(pixels, w, h, adj.dehaze);
+    }
+
+    // Sharpening (unsharp mask)
+    if adj.sharpen_amount > 0.001 {
+        apply_sharpening(pixels, w, h, adj.sharpen_amount, adj.sharpen_radius, adj.sharpen_detail, adj.sharpen_masking);
+    }
+
+    // Noise Reduction
+    if adj.nr_luminance > 0.5 || adj.nr_color > 0.5 {
+        apply_noise_reduction(pixels, w, h, adj.nr_luminance, adj.nr_color);
+    }
+
+    // Lens Distortion
+    if adj.lens_distortion.abs() > 0.001 {
+        apply_lens_distortion(pixels, w, h, adj.lens_distortion);
+    }
+
+    // Chromatic Aberration Correction
+    if adj.lens_ca_red.abs() > 0.001 || adj.lens_ca_blue.abs() > 0.001 {
+        apply_ca_correction(pixels, w, h, adj.lens_ca_red, adj.lens_ca_blue);
+    }
+
     // ── Post-pixel pass: Vignette ──
     if adj.vignette_amount.abs() > 0.001 {
         apply_vignette(pixels, width, height, adj);
@@ -758,46 +1150,97 @@ fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
 // ── Tauri Commands ──
 
 #[tauri::command]
+pub async fn load_editor_source(
+    state: tauri::State<'_, EditorState>,
+    image_path: String,
+) -> Result<(u32, u32), String> {
+    let img = image::open(&image_path).map_err(|e| format!("Failed to open image: {}", e))?;
+    let rgba = img.to_rgba8();
+    let width = rgba.width();
+    let height = rgba.height();
+    let pixels = rgba.into_raw();
+
+    let mut cache = state.cached_source.lock().unwrap();
+    *cache = Some(CachedImage {
+        path: image_path,
+        rgba: pixels,
+        width,
+        height,
+    });
+
+    Ok((width, height))
+}
+
+#[tauri::command]
+pub async fn unload_editor_source(
+    state: tauri::State<'_, EditorState>,
+) -> Result<(), String> {
+    let mut cache = state.cached_source.lock().unwrap();
+    *cache = None;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn process_image(
+    state: tauri::State<'_, EditorState>,
     image_path: String,
     adjustments: AdjustmentPayload,
     preview: bool,
 ) -> Result<ProcessResult, String> {
-    // Load image
-    let img = image::open(&image_path).map_err(|e| format!("Failed to open image: {}", e))?;
-
-    // Optionally resize for preview
-    let img = if preview {
-        let (w, h) = (img.width(), img.height());
-        let max_edge = 800u32;
-        if w > max_edge || h > max_edge {
-            let scale = max_edge as f64 / w.max(h) as f64;
-            let nw = (w as f64 * scale) as u32;
-            let nh = (h as f64 * scale) as u32;
-            img.resize(nw, nh, image::imageops::FilterType::Triangle)
+    // Try to use cached source, fallback to loading from disk
+    let (source_rgba, src_w, src_h) = {
+        let cache = state.cached_source.lock().unwrap();
+        if let Some(ref cached) = *cache {
+            if cached.path == image_path {
+                (cached.rgba.clone(), cached.width, cached.height)
+            } else {
+                drop(cache);
+                let img = image::open(&image_path).map_err(|e| format!("Failed to open image: {}", e))?;
+                let rgba = img.to_rgba8();
+                (rgba.clone().into_raw(), rgba.width(), rgba.height())
+            }
         } else {
-            img
+            drop(cache);
+            let img = image::open(&image_path).map_err(|e| format!("Failed to open image: {}", e))?;
+            let rgba = img.to_rgba8();
+            (rgba.clone().into_raw(), rgba.width(), rgba.height())
         }
-    } else {
-        img
     };
 
-    let rgba = img.to_rgba8();
-    let width = rgba.width();
-    let height = rgba.height();
-    let mut pixels = rgba.into_raw();
+    // Resize for preview if needed
+    let (mut pixels, width, height) = if preview {
+        let max_edge = 800u32;
+        if src_w > max_edge || src_h > max_edge {
+            let img_buf = image::RgbaImage::from_raw(src_w, src_h, source_rgba)
+                .ok_or_else(|| "Failed to create image buffer".to_string())?;
+            let dyn_img = image::DynamicImage::ImageRgba8(img_buf);
+            let scale = max_edge as f64 / src_w.max(src_h) as f64;
+            let nw = (src_w as f64 * scale) as u32;
+            let nh = (src_h as f64 * scale) as u32;
+            let resized = dyn_img.resize(nw, nh, image::imageops::FilterType::Triangle);
+            let rgba = resized.to_rgba8();
+            (rgba.clone().into_raw(), rgba.width(), rgba.height())
+        } else {
+            (source_rgba, src_w, src_h)
+        }
+    } else {
+        (source_rgba, src_w, src_h)
+    };
 
-    // Process in a blocking thread
+    let preview_path = state.preview_path.lock().unwrap().clone();
     let adj = adjustments;
+
     tokio::task::spawn_blocking(move || {
         process_pixels(&mut pixels, width, height, &adj);
 
-        // Encode as base64
-        use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&pixels);
+        // Write to temp file as BMP (fast, lossless, no compression overhead)
+        let img_buf = image::RgbaImage::from_raw(width, height, pixels)
+            .ok_or_else(|| "Failed to create image buffer".to_string())?;
+        img_buf.save_with_format(&preview_path, image::ImageFormat::Bmp)
+            .map_err(|e| format!("Preview save error: {}", e))?;
 
         Ok(ProcessResult {
-            data: encoded,
+            preview_path,
             width,
             height,
         })

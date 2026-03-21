@@ -5,6 +5,8 @@ mod scan;
 mod thumb;
 mod watcher;
 
+use tauri::Manager;
+
 
 
 pub fn run() {
@@ -15,6 +17,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             commands::setup_state(app.handle());
+            app.handle().manage(image_processing::EditorState::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -59,6 +62,8 @@ pub fn run() {
             // Photo editor
             commands::save_edited_photo,
             // Image processing
+            image_processing::load_editor_source,
+            image_processing::unload_editor_source,
             image_processing::process_image,
             image_processing::compute_histogram,
             image_processing::auto_enhance,

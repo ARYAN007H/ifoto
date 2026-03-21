@@ -18,6 +18,8 @@
         processImage,
         processImageFull,
         computeHistogram,
+        loadEditorSource,
+        unloadEditorSource,
         type HistogramData,
     } from "../lib/editing/imageProcessor";
     import {
@@ -27,6 +29,12 @@
         canvasToBase64,
     } from "../lib/imageProcessing";
     import { getCachedThumb } from "../lib/thumbnailCache";
+    import {
+        recordChange,
+        historyUndo,
+        historyRedo,
+        resetHistory,
+    } from "../lib/editor/historyStore";
 
     export let onClose: () => void;
 
@@ -48,8 +56,8 @@
     let imgH = 0;
     let originalImageData: ImageData | null = null;
 
-    // Undo
-    let undoStack: AdjustmentState[] = [];
+    // Undo (using historyStore)
+    // historyStore is now the source of truth for undo/redo
 
     // Resizable sidebar
     let sidebarWidth = 320;
@@ -149,6 +157,10 @@
     onMount(async () => {
         if (!$selectedPhoto) return;
         imagePath = $selectedPhoto.path;
+
+        // Cache source image in Rust for fast processing
+        await loadEditorSource(imagePath);
+
         sourceImg = new Image();
         sourceImg.crossOrigin = "anonymous";
         sourceImg.onload = () => {
@@ -169,6 +181,11 @@
         };
         sourceImg.src = convertFileSource($selectedPhoto.path);
         setTimeout(() => { if (!imageLoaded) imageLoaded = true; }, 10000);
+    });
+
+    onDestroy(() => {
+        unloadEditorSource();
+        resetHistory();
     });
 
     function initCanvas() {
@@ -221,14 +238,16 @@
 
     // ── Adjustment Handlers ──
     function onAdjustmentChange(e: CustomEvent<Partial<AdjustmentState>>) {
-        undoStack = [...undoStack, cloneAdjustments(adjustments)];
+        const changedKeys = Object.keys(e.detail);
+        const label = changedKeys.length === 1 ? changedKeys[0] : 'Multiple adjustments';
         adjustments = { ...adjustments, ...e.detail };
         hasChanges = true;
+        recordChange(label, adjustments);
         triggerProcess(true);
     }
 
     function onResetAll() {
-        undoStack = [...undoStack, cloneAdjustments(adjustments)];
+        recordChange('Reset All', cloneAdjustments(defaultAdjustments));
         adjustments = cloneAdjustments(defaultAdjustments);
         hasChanges = false;
         triggerProcess(true);
@@ -244,11 +263,24 @@
     }
 
     function undo() {
-        if (undoStack.length === 0) return;
-        adjustments = undoStack[undoStack.length - 1];
-        undoStack = undoStack.slice(0, -1);
-        triggerProcess(true);
-        if (undoStack.length === 0) hasChanges = false;
+        const prev = historyUndo();
+        if (prev) {
+            adjustments = prev;
+            triggerProcess(true);
+        }
+        // Check if we're back to original
+        const adj = adjustments;
+        const def = defaultAdjustments;
+        hasChanges = JSON.stringify(adj) !== JSON.stringify(def);
+    }
+
+    function redo() {
+        const next = historyRedo();
+        if (next) {
+            adjustments = next;
+            hasChanges = true;
+            triggerProcess(true);
+        }
     }
 
     async function handleSave() {
@@ -273,10 +305,14 @@
         if (hasChanges && !confirm("Discard unsaved changes?")) return;
         selectedPhoto.set(photo);
         adjustments = cloneAdjustments(defaultAdjustments);
-        undoStack = [];
+        resetHistory();
         hasChanges = false;
         imagePath = photo.path;
         imageLoaded = false;
+
+        // Cache new source
+        loadEditorSource(photo.path);
+
         sourceImg = new Image();
         sourceImg.crossOrigin = "anonymous";
         sourceImg.onload = () => {
@@ -309,7 +345,9 @@
     // ── Keyboard Shortcuts ──
     function handleKeydown(e: KeyboardEvent) {
         if (e.key === "Escape") onClose();
-        if (e.key === "z" && (e.ctrlKey || e.metaKey)) undo();
+        if (e.key === "z" && (e.ctrlKey || e.metaKey) && !e.shiftKey) undo();
+        if (e.key === "z" && (e.ctrlKey || e.metaKey) && e.shiftKey) redo();
+        if (e.key === "y" && (e.ctrlKey || e.metaKey)) redo();
         if (e.key === "=" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); zoomIn(); }
         if (e.key === "-" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); zoomOut(); }
         if (e.key === "0" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); zoomFit(); }
@@ -362,7 +400,7 @@
                 <button class="zoom-btn text" on:click={zoom100} title="100%">1:1</button>
             </div>
             <div class="toolbar-sep"></div>
-            <button class="tool-btn" on:click={undo} disabled={undoStack.length === 0} title="Undo (Ctrl+Z)">
+            <button class="tool-btn" on:click={undo} title="Undo (Ctrl+Z)">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12.5 8c-2.65 0-5.05.99-6.9 2.6L2 7v9h9l-3.62-3.62c1.39-1.16 3.16-1.88 5.12-1.88 3.54 0 6.55 2.31 7.6 5.5l2.37-.78C21.08 11.03 17.15 8 12.5 8z"/></svg>
             </button>
             <button class="tool-btn accent" on:click={handleSave} disabled={!hasChanges || saving}>

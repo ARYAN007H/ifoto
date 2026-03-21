@@ -1,16 +1,17 @@
 // ── Image Processor ──
 // Tauri invoke wrapper with debounce and two-resolution pipeline
+// Uses temp file transfer instead of base64 for performance
 
-import { invokeCommand } from '../store';
+import { invokeCommand, convertFileSource } from '../store';
 import { toRustPayload, type AdjustmentState } from './adjustments';
 
 interface ProcessResult {
-    data: string; // base64 RGBA
+    previewPath: string; // temp file path
     width: number;
     height: number;
 }
 
-interface HistogramData {
+export interface HistogramData {
     r: number[];
     g: number[];
     b: number[];
@@ -20,6 +21,57 @@ interface HistogramData {
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 let isProcessing = false;
 let pendingRequest: { path: string; adj: AdjustmentState; preview: boolean; resolve: (v: ImageData | null) => void } | null = null;
+let previewVersion = 0;
+
+/**
+ * Load source image into Rust cache (call once on editor open)
+ */
+export async function loadEditorSource(imagePath: string): Promise<[number, number] | null> {
+    try {
+        const result = await invokeCommand<[number, number]>('load_editor_source', { imagePath });
+        return result;
+    } catch (err) {
+        console.error('Failed to load editor source:', err);
+        return null;
+    }
+}
+
+/**
+ * Unload source image from Rust cache (call on editor close)
+ */
+export async function unloadEditorSource(): Promise<void> {
+    try {
+        await invokeCommand('unload_editor_source');
+    } catch (err) {
+        console.error('Failed to unload editor source:', err);
+    }
+}
+
+/**
+ * Load a temp file preview image into an ImageData for canvas rendering
+ */
+async function loadPreviewFile(previewPath: string, width: number, height: number): Promise<ImageData | null> {
+    return new Promise((resolve) => {
+        const img = new Image();
+        const version = ++previewVersion;
+        img.onload = () => {
+            if (version !== previewVersion) { resolve(null); return; }
+            const canvas = document.createElement('canvas');
+            canvas.width = img.naturalWidth;
+            canvas.height = img.naturalHeight;
+            const ctx = canvas.getContext('2d')!;
+            ctx.drawImage(img, 0, 0);
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            resolve(imageData);
+        };
+        img.onerror = () => {
+            console.error('Failed to load preview file');
+            resolve(null);
+        };
+        // Use asset protocol with cache-busting
+        img.src = convertFileSource(previewPath) + '?t=' + Date.now();
+    });
+}
 
 /**
  * Process image with debounce. Returns ImageData for canvas rendering.
@@ -58,16 +110,8 @@ export function processImage(
                     preview: req.preview,
                 });
 
-                if (result && result.data) {
-                    // Decode base64 RGBA data to Uint8ClampedArray
-                    const binaryStr = atob(result.data);
-                    const len = binaryStr.length;
-                    const bytes = new Uint8ClampedArray(len);
-                    for (let i = 0; i < len; i++) {
-                        bytes[i] = binaryStr.charCodeAt(i);
-                    }
-
-                    const imageData = new ImageData(bytes, result.width, result.height);
+                if (result && result.previewPath) {
+                    const imageData = await loadPreviewFile(result.previewPath, result.width, result.height);
                     req.resolve(imageData);
                 } else {
                     req.resolve(null);
@@ -97,14 +141,8 @@ export async function processImageFull(
             preview: false,
         });
 
-        if (result && result.data) {
-            const binaryStr = atob(result.data);
-            const len = binaryStr.length;
-            const bytes = new Uint8ClampedArray(len);
-            for (let i = 0; i < len; i++) {
-                bytes[i] = binaryStr.charCodeAt(i);
-            }
-            return new ImageData(bytes, result.width, result.height);
+        if (result && result.previewPath) {
+            return await loadPreviewFile(result.previewPath, result.width, result.height);
         }
     } catch (err) {
         console.error('Full-res processing failed:', err);
@@ -113,7 +151,7 @@ export async function processImageFull(
 }
 
 /**
- * Compute histogram from ImageData in a Web Worker (or inline fallback).
+ * Compute histogram from ImageData (inline, no IPC needed).
  */
 export function computeHistogram(imageData: ImageData): HistogramData {
     const data = imageData.data;
@@ -132,5 +170,3 @@ export function computeHistogram(imageData: ImageData): HistogramData {
 
     return { r, g, b, l };
 }
-
-export type { HistogramData };
